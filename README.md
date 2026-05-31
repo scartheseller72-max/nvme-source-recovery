@@ -32,6 +32,9 @@ The workflow is two steps and never touches the original drive after imaging:
         (done)                01_image_drive.sh        02_run_recovery.sh
 ```
 
+New here? The [Backstory](BACKSTORY.md) explains the incident that led to this
+toolkit — and the one insight that turned a near-hopeless case into a solvable one.
+
 ---
 
 ## Why this works — the $MFT vector
@@ -282,6 +285,7 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
 ```
 nvme-source-recovery/
 +-- README.md
++-- BACKSTORY.md           how the incident happened and why this toolkit exists
 +-- LICENSE
 +-- nvme_recover.py        recovery engine (MFT + USN + archives + source)
 +-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture
