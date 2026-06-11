@@ -11,15 +11,19 @@
 #  Order of operations (highest-yield first):
 #     1) analyze   — zero/entropy map: how much did TRIM wipe, and where is data
 #     2) mft       — recover deleted files from $MFT (resident = INTACT)
-#     3) usn       — timestamped delete log by filename ($UsnJrnl)
-#     4) archives  — ZIP / 7z / gzip carving with validation
-#     5) source    — language-aware .rs/.kt/.py/.sol carving
+#     3) usn       — timestamped delete log by filename ($UsnJrnl V2 + V3)
+#     4) archives  — ZIP / 7z / tar / gzip / xz / bzip2 carving with validation
+#     5) source    — language-aware .rs/.kt/.py/.sol/.ts/.java/... carving
 #
 #  Everything is READ-ONLY against the input.
 ###############################################################################
 set -uo pipefail
 
-IMG="${1:-}"; OUT="${2:-}"; EXTRA="${3:-}"
+IMG="${1:-}"; OUT="${2:-}"
+EXTRA=""
+for arg in "${@:3}"; do
+  [[ "$arg" == "--carve-nonresident" ]] && EXTRA="--carve-nonresident"
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="$HERE/nvme_recover.py"
 
@@ -50,10 +54,10 @@ else
   python3 "$ENGINE" mft --image "$IMG" --out "$OUT"
 fi
 
-# 3) USN journal
+# 3) USN journal (V2 + V3 records)
 python3 "$ENGINE" usn --image "$IMG" --out "$OUT" --regions "$REGIONS"
 
-# 4) Archives (ZIP / 7z / gzip), scanning only live extents for speed
+# 4) Archives (ZIP / 7z / tar / gzip / xz / bzip2), scanning only live extents
 python3 "$ENGINE" archives --image "$IMG" --out "$OUT" --regions "$REGIONS"
 
 # 5) Source-code carving
@@ -65,7 +69,8 @@ echo " RECOVERY COMPLETE — look here:"
 echo "   $OUT/10_mft/files/           recovered deleted files (original names)"
 echo "   $OUT/10_mft/mft_manifest.csv  full list of every deleted file found"
 echo "   $OUT/10_mft/usn_journal.csv   timestamped delete log"
-echo "   $OUT/20_archives/             rebuilt zip/7z + salvaged members"
+echo "   $OUT/20_archives/             rebuilt zip/7z/tar + salvaged members"
+echo "   $OUT/20_archives/{gzip,xz,bzip2}/  decompressed streams"
 echo "   $OUT/30_source/<lang>/        carved source by language"
 echo
 echo " Find a specific file fast (use a string you KNOW was in your code):"

@@ -145,16 +145,37 @@ phase_image(){
   say "   ${BLD}./02_run_recovery.sh \"$img\" \"$dst/recovered\"${RST}"
 }
 
+phase_verify(){
+  local dst="${1:-}"
+  [[ -n "$dst" ]] || { err "Usage: $0 verify <DEST_DIR>"; exit 1; }
+  [[ -d "$dst" ]] || { err "Dest dir '$dst' does not exist."; exit 1; }
+  local f found=0 bad=0
+  shopt -s nullglob
+  for f in "$dst"/*.sha256; do
+    found=1
+    if ( cd "$dst" && sha256sum -c "$(basename "$f")" ); then
+      ok "verified: $(basename "$f")"
+    else
+      bad=1; err "CHECKSUM MISMATCH: $(basename "$f") — image may be corrupt!"
+    fi
+  done
+  ((found)) || { warn "No .sha256 files found in $dst — run 'image' first."; exit 1; }
+  ((bad)) && exit 1
+  ok "All image checksums verified."
+}
+
 case "${1:-}" in
   devices) phase_devices ;;
   state)   shift; phase_state "$@" ;;
   image)   shift; phase_image "$@" ;;
+  verify)  shift; phase_verify "$@" ;;
   *)
     say "${BLD}01_image_drive.sh — read-only forensic imaging (run from Linux LIVE USB)${RST}"
     say ""
     say "  $0 devices                          # 1. list disks"
     say "  $0 state  /dev/nvme0n1 /mnt/dest     # 2. capture SMART/TRIM state (optional but smart)"
     say "  $0 image  /dev/nvme0n1 /mnt/dest     # 3. read-only clone -> image file"
+    say "  $0 verify /mnt/dest                  # 4. re-check image SHA-256 (before/after moving it)"
     say ""
     say "Then run:  ./02_run_recovery.sh /mnt/dest/rescue-nvme0n1.img /mnt/dest/recovered"
     ;;

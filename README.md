@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-2.0.0-8a5cf5">
   <img alt="self-test" src="https://img.shields.io/badge/self--test-ALL_PASSED-2ea44f">
   <img alt="source mode" src="https://img.shields.io/badge/source-READ--ONLY-3b6ea8">
   <img alt="python" src="https://img.shields.io/badge/python-3.6%2B_stdlib-f2a33c">
@@ -105,28 +106,33 @@ the realistic win this toolkit is engineered around.
     <tr>
       <td align="center"><img src="assets/icon-mft.png" width="44" alt="mft"></td>
       <td><code>mft</code></td>
-      <td>Scans <code>$MFT</code>: recovers <strong>resident files intact</strong>;
-      for non-resident files it lists the exact clusters and can targeted-carve
-      them with <code>--carve-nonresident</code>.</td>
+      <td>Scans <code>$MFT</code>: recovers <strong>resident files intact</strong>
+      with full directory paths rebuilt from the MFT record numbers (works even
+      for scattered record fragments); for non-resident files it lists the exact
+      clusters and can targeted-carve them with <code>--carve-nonresident</code>.</td>
     </tr>
     <tr>
       <td align="center"><img src="assets/icon-usn.png" width="44" alt="usn"></td>
       <td><code>usn</code></td>
-      <td>Parses the <code>$UsnJrnl</code> change journal into a timestamped
-      <strong>delete log by filename</strong>.</td>
+      <td>Parses the <code>$UsnJrnl</code> change journal (<strong>V2 and V3</strong>
+      records) into a timestamped <strong>delete log by filename</strong>.</td>
     </tr>
     <tr>
       <td align="center"><img src="assets/icon-archives.png" width="44" alt="archives"></td>
       <td><code>archives</code></td>
       <td><strong>ZIP</strong> (central-directory reconstruction + per-member
-      salvage), <strong>7z</strong> (CRC-validated, exact size from header), and
-      <strong>gzip</strong> stream recovery.</td>
+      salvage, including <em>streamed</em> members via data descriptors),
+      <strong>7z</strong> (CRC-validated, exact size from header),
+      <strong>tar</strong> (checksum-validated, original member names), and
+      <strong>gzip / xz / bzip2</strong> stream recovery.</td>
     </tr>
     <tr>
       <td align="center"><img src="assets/icon-source.png" width="44" alt="source"></td>
       <td><code>source</code></td>
       <td>Language-aware carving of raw bytes into buckets:
-      <code>.rs / .kt / .py / .sol / .go / .js / .c / .json / .toml / .md</code>.</td>
+      <code>.rs / .kt / .py / .sol / .go / .js / .ts / .java / .c / .sh / .sql /
+      .html / .json / .toml / .md</code> — with automatic duplicate-fragment
+      de-duplication.</td>
     </tr>
   </tbody>
 </table>
@@ -167,6 +173,7 @@ chmod +x 01_image_drive.sh 02_run_recovery.sh
 ./01_image_drive.sh devices                       # identify your /dev/nvmeXn1
 ./01_image_drive.sh state /dev/nvme0n1 /mnt/dest   # capture SMART/TRIM evidence (optional)
 ./01_image_drive.sh image /dev/nvme0n1 /mnt/dest   # -> /mnt/dest/rescue-nvme0n1.img (+ .sha256)
+./01_image_drive.sh verify /mnt/dest               # re-check image SHA-256 any time later
 ```
 
 Safety is enforced: the script refuses if the source is mounted or if the
@@ -213,12 +220,15 @@ recovered/
 +-- 20_archives/
 |   +-- zip/                  <- rebuilt .zip (members extracted)
 |   +-- zip_members/          <- individual files salvaged from broken zips
+|   |                            (including streamed members via data descriptors)
 |   +-- 7z/                   <- carved .7z (extract with: 7z x)
-|   +-- gzip/                 <- decompressed gzip streams
+|   +-- tar/                  <- carved tar archives (members + original paths)
+|   +-- gzip/ xz/ bzip2/      <- decompressed compression streams
 +-- 30_source/
-|   +-- rust/ kotlin/ python/ solidity/ go/ javascript/ ...
+|   +-- rust/ kotlin/ python/ solidity/ go/ javascript/ typescript/ java/ ...
 |   +-- source_manifest.csv   <- offset, language, confidence, preview
 +-- RECOVERY_SUMMARY.txt
++-- RECOVERY_SUMMARY.json     <- same summary, machine-readable
 ```
 
 ---
@@ -229,9 +239,13 @@ recovered/
 python3 nvme_recover.py selftest --out /tmp/nvme_selftest
 ```
 
-Builds a synthetic NTFS-style image and asserts: resident MFT files recovered
-byte-for-byte, USN delete event parsed, ZIP reconstructed with members extracted,
-and source fragments correctly language-classified. Prints `ALL TESTS PASSED`.
+Builds a synthetic NTFS-style image and asserts every vector end-to-end:
+resident MFT files recovered byte-for-byte (including a **deleted** file and a
+file inside a subdirectory, proving path reconstruction), USN V2 **and** V3
+delete events parsed, ZIP reconstructed with members extracted, a streamed ZIP
+member salvaged via its data descriptor, 7z / tar / gzip / xz / bzip2 carved
+and decompressed, and source fragments correctly language-classified
+(python / java / typescript / solidity). Prints `ALL TESTS PASSED`.
 
 ---
 
@@ -243,14 +257,37 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
   analyze   --block-size N             zero/entropy region map
   mft       [--carve-nonresident]      $MFT mining (+ optional cluster carve)
             [--cluster-size N] [--mft-offset N]
-  usn                                  $UsnJrnl delete log
-  archives                             ZIP / 7z / gzip carving
+  usn                                  $UsnJrnl delete log (V2 + V3 records)
+  archives                             ZIP / 7z / tar / gzip / xz / bzip2 carving
   source    [--include-unclassified]   language-aware source carving
-  all       [--carve-nonresident]      full pipeline + summary
+  all       [--carve-nonresident]      full pipeline + summary (.txt + .json)
   selftest                             self-validate the engine
 
   common:   --regions <regions.json>   restrict scan to live extents (faster)
+            --version                  print engine version
 ```
+
+---
+
+## What's new in v2.0.0
+
+- **MFT path reconstruction via record numbers** — full `dir/sub/file.ext`
+  paths are now rebuilt from the record number stored in each FILE record
+  header (NTFS 3.1+), so even MFT fragments found *outside* the contiguous
+  table resolve correctly. Created timestamps added to the manifest.
+- **USN V3 support** — journals from Windows 8 / Server 2012+ volumes
+  (128-bit file references) are parsed alongside V2.
+- **Streamed-ZIP salvage** — members written with flag bit 3 (sizes only in
+  the trailing data descriptor) are now recovered and CRC-validated.
+- **Three new carvers** — `tar` (header-checksum validated, original member
+  names and paths), `xz`, and `bzip2` streams (both decompressed in-engine,
+  still stdlib-only).
+- **Five new source languages** — TypeScript, Java, Shell, SQL, and HTML,
+  plus SHA-1 de-duplication of identical fragments.
+- **Correctness & ops** — window-overlap duplicate hits eliminated across all
+  scanners, machine-readable `RECOVERY_SUMMARY.json`, `--version` flag,
+  `01_image_drive.sh verify` phase, and a selftest that now asserts 15 checks
+  end-to-end (deleted-file recovery and subdirectory paths included).
 
 ---
 

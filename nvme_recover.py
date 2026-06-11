@@ -22,10 +22,14 @@ RECOVERY VECTORS (highest yield first for lost source code)
                                   blind carving). Survives because TRIM frees
                                   the DATA clusters, not the $MFT system file.
   2. $UsnJrnl change journal -- timestamped list of every create/delete by
-                                name; reconstructs exactly what was lost.
+                                name (USN_RECORD V2 and V3); reconstructs
+                                exactly what was lost.
   3. Archive carving         -- ZIP (central-directory reconstruction + per
-                                member salvage), 7z (CRC-validated, exact size
-                                from header), gzip streams.
+                                member salvage, including streamed members via
+                                data descriptors), 7z (CRC-validated, exact
+                                size from header), tar (checksum-validated,
+                                original member names), and gzip / xz / bzip2
+                                streams.
   4. Source-text carving     -- language-aware scan for .rs/.kt/.py/.sol/etc.
                                 directly from raw bytes (no metadata needed).
   5. Region analysis         -- zero/0xFF/entropy map so you SEE up front how
@@ -46,9 +50,13 @@ Author: HyperAgent recovery toolkit.  Stdlib-only (optional: py7zr for 7z verify
 
 import argparse
 import binascii
+import bz2
+import csv
 import datetime
+import hashlib
 import io
 import json
+import math
 import mmap
 import os
 import re
@@ -57,6 +65,13 @@ import struct
 import sys
 import zlib
 import zipfile
+
+try:
+    import lzma
+except ImportError:        # Python built without liblzma
+    lzma = None
+
+__version__ = "2.0.0"
 
 # --------------------------------------------------------------------------- #
 #  Small utilities                                                            #
@@ -206,8 +221,10 @@ class Reader(object):
 
 
 def iter_windows(reader, extents, window=16 * MiB, overlap=1 * MiB):
-    """Yield (abs_offset, data) windows over the given extents, with overlap so
-    signatures spanning a boundary are fully present in at least one window."""
+    """Yield (abs_offset, data, span) windows over the given extents. `data`
+    covers span+overlap bytes so signatures spanning a window boundary are fully
+    present in at least one window; matches that START at or beyond `span`
+    belong to the next window and must be skipped (avoids duplicates)."""
     for (s, e) in extents:
         s = max(0, s)
         e = min(reader.size, e)
@@ -215,7 +232,7 @@ def iter_windows(reader, extents, window=16 * MiB, overlap=1 * MiB):
         while pos < e:
             n = min(window, e - pos)
             data = reader.read(pos, n + overlap)
-            yield pos, data
+            yield pos, data, n
             pos += n
 
 
@@ -226,7 +243,6 @@ def iter_windows(reader, extents, window=16 * MiB, overlap=1 * MiB):
 def shannon_entropy(data):
     if not data:
         return 0.0
-    import math
     counts = [0] * 256
     for b in data:
         counts[b] += 1
@@ -498,10 +514,15 @@ def parse_mft_record(rec):
     attr_off = le(rec[0x14:0x16])
     used = le(rec[0x18:0x1C]) or len(rec)
     seq = le(rec[0x10:0x12])
+    usa_off = le(rec[0x04:0x06])
+    # NTFS 3.1+ stores the MFT record number in the header; older layouts
+    # (USA offset < 0x30) do not have the field.
+    record_no = le(rec[0x2C:0x30]) if usa_off >= 0x30 else None
     info = {
         "in_use": bool(flags & 0x01),
         "is_dir": bool(flags & 0x02),
         "seq": seq,
+        "record_no": record_no,
         "names": [],          # list of (namespace, name, parent_entry)
         "real_size": 0,
         "alloc_size": 0,
@@ -604,11 +625,11 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
     scanned = 0
 
     log("[mft] scanning for MFT records (record size %dB)..." % rec_size)
-    for base, data in iter_windows(reader, extents, window=32 * MiB, overlap=rec_size):
+    for base, data, span in iter_windows(reader, extents, window=32 * MiB, overlap=rec_size):
         start = 0
         while True:
             idx = data.find(b"FILE", start)
-            if idx == -1:
+            if idx == -1 or idx >= span:
                 break
             start = idx + 4
             abs_off = base + idx
@@ -639,31 +660,38 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
 
     log("[mft] parsed %d MFT records with names" % found)
 
-    # Build an entry->name map for path reconstruction. MFT entry number can be
-    # inferred from offset when MFT is contiguous; otherwise we use the parent
-    # references and a fabricated index keyed by (name,parent).
-    # Best-effort: index by sequence of discovery, resolve parents by FILE_NAME.
-    # We reconstruct paths using parent refs walked against records we did parse.
+    # Build an entry->record map for path reconstruction. Preferred key is the
+    # MFT record number stored in the record header (NTFS 3.1+), which works
+    # even for records found OUTSIDE the contiguous MFT (e.g. $MFT fragments or
+    # mirror copies). Fallback: infer the entry number from the record's offset
+    # relative to the MFT start.
     entry_index = {}
-    if geom.get("mft_offset") is not None:
-        for info in by_offset:
-            rel = info["offset"] - geom["mft_offset"]
+    mft_off = geom.get("mft_offset")
+    for info in by_offset:
+        rno = info.get("record_no")
+        if rno is None and mft_off is not None:
+            rel = info["offset"] - mft_off
             if rel >= 0 and rel % rec_size == 0:
-                entry_index[rel // rec_size] = info
+                rno = rel // rec_size
+        if rno is not None and rno not in entry_index:
+            entry_index[rno] = info
+
+    path_cache = {}
 
     def resolve_path(info, depth=0):
+        key = id(info)
+        if key in path_cache:
+            return path_cache[key]
         name, parent = pick_name(info["names"])
-        if depth > 64:
-            return name
-        if parent == 5 or parent == 0 or parent not in entry_index:
-            return name
-        pinfo = entry_index.get(parent)
-        if not pinfo or pinfo is info:
-            return name
-        return resolve_path(pinfo, depth + 1).rstrip("/") + "/" + name
+        out = name
+        if depth <= 64 and parent not in (0, 5):
+            pinfo = entry_index.get(parent)
+            if pinfo is not None and pinfo is not info:
+                out = resolve_path(pinfo, depth + 1).rstrip("/") + "/" + name
+        path_cache[key] = out
+        return out
 
     # Recover files + write manifest
-    import csv
     man_path = os.path.join(m_dir, "mft_manifest.csv")
     resident_recovered = 0
     targeted_recovered = 0
@@ -672,7 +700,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
     with open(man_path, "w", newline="") as mf:
         w = csv.writer(mf)
         w.writerow(["path", "size_bytes", "is_dir", "in_use", "storage",
-                    "modified", "recovered", "recovered_path", "note"])
+                    "created", "modified", "recovered", "recovered_path", "note"])
         for info in by_offset:
             if info["is_dir"]:
                 continue
@@ -681,6 +709,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                 continue
             path = resolve_path(info) if entry_index else name
             size = info["real_size"]
+            created = info.get("si_times", {}).get("created", "")
             modified = info.get("si_times", {}).get("modified", "")
             listed += 1
             recovered = ""
@@ -720,7 +749,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
 
             w.writerow([path, size, info["is_dir"], info["in_use"],
                         "resident" if info["resident_data"] is not None else "non-resident",
-                        modified, recovered, rec_path, note])
+                        created, modified, recovered, rec_path, note])
 
     log("[mft] DONE: %d files listed | %d resident recovered INTACT | "
         "%d targeted-carved | %d non-resident were zero" %
@@ -754,10 +783,63 @@ def decode_reason(reason):
     return "|".join(out) if out else ("0x%08x" % reason)
 
 
+# USN_RECORD field layouts. V2 (Windows XP+) uses 64-bit file references;
+# V3 (Windows 8 / Server 2012+, ReFS-capable volumes) uses 128-bit FILE_ID_128.
+USN_LAYOUTS = {
+    2: {"sig": b"\x02\x00\x00\x00", "min_len": 0x3C,
+        "file_ref": (0x08, 8), "parent_ref": (0x10, 8),
+        "ts": 0x20, "reason": 0x28, "attrs": 0x34,
+        "name_len": 0x38, "name_off_field": 0x3A, "name_at": 0x3C},
+    3: {"sig": b"\x03\x00\x00\x00", "min_len": 0x4C,
+        "file_ref": (0x08, 16), "parent_ref": (0x18, 16),
+        "ts": 0x30, "reason": 0x38, "attrs": 0x44,
+        "name_len": 0x48, "name_off_field": 0x4A, "name_at": 0x4C},
+}
+
+
+def _scan_usn_window(data, span, version):
+    """Yield (version, ts, reason, file_ref, parent_ref, attrs, name) tuples
+    for every valid USN record of the given version in this window."""
+    L = USN_LAYOUTS[version]
+    n = len(data)
+    i = 0
+    while True:
+        j = data.find(L["sig"], i)      # MajorVersion, MinorVersion=0
+        if j == -1:
+            break
+        i = j + 1
+        rec_off = j - 4                  # RecordLength precedes the version
+        if rec_off < 0 or rec_off >= span:
+            continue
+        rlen = le(data[rec_off:rec_off + 4])
+        if rlen < L["min_len"] or rlen > 0x400 or rec_off + rlen > n:
+            continue
+        name_len = le(data[rec_off + L["name_len"]:rec_off + L["name_len"] + 2])
+        name_off = le(data[rec_off + L["name_off_field"]:rec_off + L["name_off_field"] + 2])
+        if name_off != L["name_at"] or name_len == 0 or name_len % 2 or name_len > 510:
+            continue
+        if name_off + name_len > rlen:
+            continue
+        try:
+            name = data[rec_off + name_off: rec_off + name_off + name_len].decode("utf-16-le", "strict")
+        except Exception:
+            continue
+        if not name or any(ord(c) < 0x20 for c in name):
+            continue
+        fo, fl = L["file_ref"]
+        po, pl = L["parent_ref"]
+        # mask to the 48-bit MFT record number (drops the sequence counter)
+        file_ref = le(data[rec_off + fo:rec_off + fo + fl]) & 0xFFFFFFFFFFFF
+        parent_ref = le(data[rec_off + po:rec_off + po + pl]) & 0xFFFFFFFFFFFF
+        ts = filetime_to_iso(le(data[rec_off + L["ts"]:rec_off + L["ts"] + 8]))
+        reason = le(data[rec_off + L["reason"]:rec_off + L["reason"] + 4])
+        attrs = le(data[rec_off + L["attrs"]:rec_off + L["attrs"] + 4])
+        yield version, ts, reason, file_ref, parent_ref, attrs, name
+
+
 def mine_usn(reader, outdir, regions=None, max_records=20_000_000):
-    """Scan for USN_RECORD_V2 entries and dump a timestamped change log.
+    """Scan for USN_RECORD V2 and V3 entries and dump a timestamped change log.
     This recovers filenames of deleted files even when MFT records are gone."""
-    import csv
     u_dir = os.path.join(outdir, "10_mft")
     os.makedirs(u_dir, exist_ok=True)
     out_csv = os.path.join(u_dir, "usn_journal.csv")
@@ -765,47 +847,22 @@ def mine_usn(reader, outdir, regions=None, max_records=20_000_000):
 
     count = 0
     deletes = 0
-    log("[usn] scanning for $UsnJrnl V2 records ...")
+    log("[usn] scanning for $UsnJrnl V2/V3 records ...")
     with open(out_csv, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["timestamp", "reason", "file_ref", "parent_ref", "attrs", "name"])
-        for base, data in iter_windows(reader, extents, window=32 * MiB, overlap=1024):
-            n = len(data)
-            i = 0
-            # USN V2 records: major version 2, minor 0 at offset +4. Scan on that.
-            while True:
-                j = data.find(b"\x02\x00\x00\x00", i)   # MajorVersion=2, MinorVersion=0
-                if j == -1:
-                    break
-                i = j + 1
-                rec_off = j - 4                          # RecordLength precedes version
-                if rec_off < 0:
-                    continue
-                rlen = le(data[rec_off:rec_off + 4])
-                if rlen < 0x3C or rlen > 0x400 or rec_off + rlen > n:
-                    continue
-                name_len = le(data[rec_off + 0x38:rec_off + 0x3A])
-                name_off = le(data[rec_off + 0x3A:rec_off + 0x3C])
-                if name_off != 0x3C or name_len == 0 or name_len % 2 or name_len > 510:
-                    continue
-                if rec_off + name_off + name_len > rec_off + rlen:
-                    continue
-                try:
-                    name = data[rec_off + name_off: rec_off + name_off + name_len].decode("utf-16-le", "strict")
-                except Exception:
-                    continue
-                if not name or any(ord(c) < 0x20 for c in name):
-                    continue
-                file_ref = le(data[rec_off + 0x08:rec_off + 0x10])
-                parent_ref = le(data[rec_off + 0x10:rec_off + 0x18])
-                ts = filetime_to_iso(le(data[rec_off + 0x20:rec_off + 0x28]))
-                reason = le(data[rec_off + 0x28:rec_off + 0x2C])
-                attrs = le(data[rec_off + 0x34:rec_off + 0x38])
-                w.writerow([ts, decode_reason(reason), file_ref & 0xFFFFFFFFFFFF,
-                            parent_ref & 0xFFFFFFFFFFFF, "0x%x" % attrs, name])
-                count += 1
-                if reason & 0x200:
-                    deletes += 1
+        w.writerow(["timestamp", "usn_version", "reason", "file_ref",
+                    "parent_ref", "attrs", "name"])
+        for base, data, span in iter_windows(reader, extents, window=32 * MiB, overlap=1024):
+            for version in (2, 3):
+                for (ver, ts, reason, file_ref, parent_ref, attrs, name) in \
+                        _scan_usn_window(data, span, version):
+                    w.writerow([ts, ver, decode_reason(reason), file_ref,
+                                parent_ref, "0x%x" % attrs, name])
+                    count += 1
+                    if reason & 0x200:
+                        deletes += 1
+                    if count >= max_records:
+                        break
                 if count >= max_records:
                     break
             if count >= max_records:
@@ -838,11 +895,11 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
 
     # --- 4a. Whole-archive reconstruction from End-Of-Central-Directory ---
     log("[zip] reconstructing archives from EOCD records ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
         start = 0
         while True:
             idx = data.find(b"PK\x05\x06", start)
-            if idx == -1:
+            if idx == -1 or idx >= span:
                 break
             start = idx + 4
             eocd_abs = base + idx
@@ -887,11 +944,11 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
 
     # --- 4b. Per-member salvage from local file headers (broken central dir) ---
     log("[zip] salvaging individual members from local headers ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
         start = 0
         while True:
             idx = data.find(b"PK\x03\x04", start)
-            if idx == -1:
+            if idx == -1 or idx >= span:
                 break
             start = idx + 4
             lh_abs = base + idx
@@ -907,27 +964,53 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
             uncomp_size = le(lh[22:26])
             name_len = le(lh[26:28])
             extra_len = le(lh[28:30])
-            if flag & 0x08 or comp_size == 0 or comp_size > max_size:
-                continue                                  # streamed/unknown size
-            if name_len > 4096:
+            if name_len > 4096 or comp_size > max_size:
                 continue
             name = reader.read(lh_abs + 30, name_len).decode("utf-8", "replace")
             data_off = lh_abs + 30 + name_len + extra_len
-            comp = reader.read(data_off, comp_size)
-            if len(comp) < comp_size:
-                continue
-            try:
-                if method == 0:
-                    raw = comp
-                elif method == 8:
-                    raw = zlib.decompressobj(-15).decompress(comp)
-                else:
+
+            if flag & 0x08 or comp_size == 0:
+                # Streamed member: sizes live in a trailing data descriptor.
+                # Find the PK\x07\x08 descriptor whose comp_size matches the
+                # distance from the data start, then CRC-validate the inflate.
+                raw = None
+                probe = reader.read(data_off, 8 * MiB)
+                dpos = 0
+                while True:
+                    k = probe.find(b"PK\x07\x08", dpos)
+                    if k == -1 or k + 16 > len(probe):
+                        break
+                    dpos = k + 1
+                    dcrc, dcsize, dusize = struct.unpack("<III", probe[k + 4:k + 16])
+                    if dcsize != k:
+                        continue
+                    comp = probe[:k]
+                    try:
+                        cand = comp if method == 0 else zlib.decompressobj(-15).decompress(comp)
+                    except Exception:
+                        continue
+                    if (binascii.crc32(cand) & 0xFFFFFFFF) == dcrc and \
+                            (not dusize or len(cand) == dusize):
+                        raw, crc = cand, dcrc
+                        break
+                if raw is None:
                     continue
-            except Exception:
-                continue
-            if uncomp_size and len(raw) != uncomp_size:
-                # partial inflate is still useful for text; keep what we got
-                pass
+            else:
+                comp = reader.read(data_off, comp_size)
+                if len(comp) < comp_size:
+                    continue
+                try:
+                    if method == 0:
+                        raw = comp
+                    elif method == 8:
+                        raw = zlib.decompressobj(-15).decompress(comp)
+                    else:
+                        continue
+                except Exception:
+                    continue
+                if uncomp_size and len(raw) != uncomp_size:
+                    # partial inflate is still useful for text; keep what we got
+                    pass
             ok = (not crc) or (binascii.crc32(raw) & 0xFFFFFFFF) == crc
             tag = "ok" if ok else "crcfail"
             safe_write(mem_dir, (name or ("member_%012x" % lh_abs)) + "." + tag, raw)
@@ -947,11 +1030,11 @@ def carve_7z(reader, outdir, regions=None, max_size=8 * GiB):
     carved = []
     n = 0
     log("[7z] scanning for CRC-validated 7z headers ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=64):
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=64):
         start = 0
         while True:
             idx = data.find(sig, start)
-            if idx == -1:
+            if idx == -1 or idx >= span:
                 break
             start = idx + 6
             abs_off = base + idx
@@ -987,11 +1070,11 @@ def carve_gzip(reader, outdir, regions=None, max_member=512 * MiB):
     extents = regions if regions else [(0, reader.size)]
     n = 0
     log("[gz] scanning for gzip streams ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=64):
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=64):
         start = 0
         while True:
             idx = data.find(b"\x1f\x8b\x08", start)
-            if idx == -1:
+            if idx == -1 or idx >= span:
                 break
             start = idx + 3
             abs_off = base + idx
@@ -1012,6 +1095,137 @@ def carve_gzip(reader, outdir, regions=None, max_member=512 * MiB):
             log("[gz]   @0x%x -> %s decompressed" % (abs_off, human(len(out))))
     log("[gz] DONE: %d gzip streams" % n)
     return {"count": n}
+
+
+def carve_xz(reader, outdir, regions=None, max_member=512 * MiB):
+    x_dir = os.path.join(outdir, "20_archives", "xz")
+    os.makedirs(x_dir, exist_ok=True)
+    if lzma is None:
+        log("[xz] python lzma module unavailable -- skipping xz carving")
+        return {"count": 0}
+    extents = regions if regions else [(0, reader.size)]
+    n = 0
+    log("[xz] scanning for xz streams ...")
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=64):
+        start = 0
+        while True:
+            idx = data.find(b"\xfd7zXZ\x00", start)
+            if idx == -1 or idx >= span:
+                break
+            start = idx + 6
+            abs_off = base + idx
+            blob = reader.read(abs_off, max_member)
+            try:
+                d = lzma.LZMADecompressor(lzma.FORMAT_XZ)
+                out = d.decompress(blob, max_member)
+            except Exception:
+                continue
+            if len(out) < 16:
+                continue
+            safe_write(x_dir, "stream_%012x.bin" % abs_off, out)
+            n += 1
+            log("[xz]   @0x%x -> %s decompressed" % (abs_off, human(len(out))))
+    log("[xz] DONE: %d xz streams" % n)
+    return {"count": n}
+
+
+def carve_bzip2(reader, outdir, regions=None, max_member=512 * MiB):
+    b_dir = os.path.join(outdir, "20_archives", "bzip2")
+    os.makedirs(b_dir, exist_ok=True)
+    extents = regions if regions else [(0, reader.size)]
+    n = 0
+    log("[bz2] scanning for bzip2 streams ...")
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=64):
+        start = 0
+        while True:
+            idx = data.find(b"BZh", start)
+            if idx == -1 or idx >= span:
+                break
+            start = idx + 3
+            # "BZh" + level 1-9 + compressed-block magic (pi)
+            if not (b"1" <= data[idx + 3:idx + 4] <= b"9"):
+                continue
+            if data[idx + 4:idx + 10] != b"\x31\x41\x59\x26\x53\x59":
+                continue
+            abs_off = base + idx
+            blob = reader.read(abs_off, max_member)
+            try:
+                d = bz2.BZ2Decompressor()
+                out = d.decompress(blob, max_member)
+            except Exception:
+                continue
+            if len(out) < 16:
+                continue
+            safe_write(b_dir, "stream_%012x.bin" % abs_off, out)
+            n += 1
+            log("[bz2]   @0x%x -> %s decompressed" % (abs_off, human(len(out))))
+    log("[bz2] DONE: %d bzip2 streams" % n)
+    return {"count": n}
+
+
+def _tar_checksum_ok(hdr):
+    """Validate a 512-byte tar header via its checksum field (kills false hits)."""
+    if len(hdr) < 512:
+        return False
+    try:
+        stored = int(hdr[148:156].split(b"\x00")[0].strip() or b"", 8)
+    except ValueError:
+        return False
+    calc = sum(hdr[:148]) + 8 * 0x20 + sum(hdr[156:512])
+    return calc == stored
+
+
+def carve_tar(reader, outdir, regions=None, max_members=100_000, max_file=2 * GiB):
+    """Carve tar archives via the 'ustar' magic + header checksum, walking the
+    member chain to recover every file WITH its original name and path."""
+    t_dir = os.path.join(outdir, "20_archives", "tar")
+    os.makedirs(t_dir, exist_ok=True)
+    extents = regions if regions else [(0, reader.size)]
+    carved = []
+    archives = 0
+    members = 0
+    log("[tar] scanning for checksum-validated tar headers ...")
+    for base, data, span in iter_windows(reader, extents, window=64 * MiB, overlap=1024):
+        start = 0
+        while True:
+            idx = data.find(b"ustar", start)
+            if idx == -1 or idx >= span:
+                break
+            start = idx + 5
+            hdr_off = base + idx - 257            # magic sits at +257 in the header
+            if hdr_off < 0 or _overlaps(carved, hdr_off, hdr_off + 512):
+                continue
+            # walk the member chain from this header
+            pos = hdr_off
+            found = []
+            while len(found) < max_members:
+                hdr = reader.read(pos, 512)
+                if len(hdr) < 512 or hdr[257:262] != b"ustar" or not _tar_checksum_ok(hdr):
+                    break
+                name = hdr[0:100].split(b"\x00")[0].decode("utf-8", "replace")
+                prefix = hdr[345:500].split(b"\x00")[0].decode("utf-8", "replace")
+                try:
+                    size = int(hdr[124:136].split(b"\x00")[0].strip() or b"0", 8)
+                except ValueError:
+                    break
+                if size < 0 or size > max_file:
+                    break
+                typeflag = hdr[156:157]
+                full_name = (prefix + "/" + name) if prefix else name
+                if typeflag in (b"0", b"\x00") and name:
+                    found.append((pos + 512, size, full_name))
+                pos += 512 + ((size + 511) // 512) * 512
+            if not found:
+                continue
+            arc_dir = os.path.join(t_dir, "archive_%012x" % hdr_off)
+            for (doff, size, nm) in found:
+                safe_write(arc_dir, nm, reader.read(doff, size))
+                members += 1
+            carved.append((hdr_off, pos))
+            archives += 1
+            log("[tar]   @0x%x  %d members -> %s" % (hdr_off, len(found), arc_dir))
+    log("[tar] DONE: %d tar archives, %d members" % (archives, members))
+    return {"archives": archives, "members": members}
 
 
 # --------------------------------------------------------------------------- #
@@ -1062,6 +1276,42 @@ LANG_RULES = {
         "strong": [rb"\bfunction\s+\w+\s*\(", rb"=>\s*\{", rb"\bconst\s+\w+\s*=",
                    rb"\bmodule\.exports\b", rb"\brequire\s*\(", rb"export\s+(default|const|function)"],
         "weak": [rb"\blet\s+\w+\s*=", rb"console\.log", rb"\bawait\b"],
+    },
+    "typescript": {
+        "ext": "ts",
+        "strong": [rb"\bexport\s+(interface|type)\s+\w+", rb"\binterface\s+\w+\s*\{",
+                   rb"\btype\s+\w+\s*=", rb":\s*(string|number|boolean)\b",
+                   rb"\bimplements\s+\w+", rb"\breadonly\s+\w+\s*:"],
+        "weak": [rb"\benum\s+\w+", rb"\bprivate\s+\w+\s*:", rb"<\w+>\s*\(",
+                 rb"\bas\s+const\b"],
+    },
+    "java": {
+        "ext": "java",
+        "strong": [rb"\bpublic\s+(final\s+)?class\s+\w+", rb"\bpublic\s+static\s+void\s+main\b",
+                   rb"\bSystem\.out\.print", rb"\bimport\s+java[x]?\.",
+                   rb"@Override\b", rb"\bprivate\s+(static\s+)?final\b"],
+        "weak": [rb"\bnew\s+\w+\s*\(", rb"\bextends\s+\w+", rb"\bthrows\s+\w+",
+                 rb"\bvoid\s+\w+\s*\("],
+    },
+    "shell": {
+        "ext": "sh",
+        "strong": [rb"(?m)^#!.*\b(ba|z|da)?sh\b", rb"(?m)^\s*fi\s*$", rb"(?m)^\s*esac\s*$",
+                   rb"\[\[\s[^\n]+\s\]\]", rb"\$\{\w+[:#%/-]"],
+        "weak": [rb"(?m)^\s*if\s+\[", rb"\blocal\s+\w+=", rb"\becho\s+",
+                 rb"(?m)^\s*done\s*$"],
+    },
+    "sql": {
+        "ext": "sql",
+        "strong": [rb"(?i)\bCREATE\s+TABLE\b", rb"(?i)\bSELECT\b[^\n;]{0,200}\bFROM\b",
+                   rb"(?i)\bINSERT\s+INTO\b", rb"(?i)\bALTER\s+TABLE\b",
+                   rb"(?i)\bPRIMARY\s+KEY\b"],
+        "weak": [rb"(?i)\bWHERE\b", rb"(?i)\bVARCHAR\b", rb"(?i)\bJOIN\b"],
+    },
+    "html": {
+        "ext": "html",
+        "strong": [rb"(?i)<!DOCTYPE\s+html", rb"(?i)<html\b", rb"(?i)<div\b[^>]*>",
+                   rb"(?i)<body\b"],
+        "weak": [rb"(?i)</\w+>", rb"(?i)<a\s+href=", rb"(?i)<script\b"],
     },
     "go": {
         "ext": "go",
@@ -1118,24 +1368,32 @@ def carve_source(reader, outdir, regions=None, min_len=160,
     base_dir = os.path.join(outdir, "30_source")
     os.makedirs(base_dir, exist_ok=True)
     extents = regions if regions else [(0, reader.size)]
-    import csv
     man = os.path.join(base_dir, "source_manifest.csv")
     counts = {}
     processed_upto = -1
     saved = 0
+    dupes = 0
+    seen_hashes = set()
 
     log("[src] scanning for source-code text runs ...")
     with open(man, "w", newline="") as mf:
         w = csv.writer(mf)
         w.writerow(["offset_hex", "length", "language", "score", "path", "preview"])
-        for base, data in iter_windows(reader, extents, window=32 * MiB, overlap=1 * MiB):
+        for base, data, span in iter_windows(reader, extents, window=32 * MiB, overlap=1 * MiB):
             for m in TEXT_RUN.finditer(data):
+                if m.start() >= span:
+                    break
                 s_abs = base + m.start()
                 e_abs = base + m.end()
                 if s_abs <= processed_upto:
                     continue
                 blob = m.group()
                 if len(blob) < min_len:
+                    continue
+                digest = hashlib.sha1(blob).digest()
+                if digest in seen_hashes:
+                    dupes += 1
+                    processed_upto = e_abs
                     continue
                 key, ext, score = classify_text(blob)
                 if not key:
@@ -1146,24 +1404,28 @@ def carve_source(reader, outdir, regions=None, min_len=160,
                 os.makedirs(lang_dir, exist_ok=True)
                 path = safe_write(lang_dir, "src_%012x.%s" % (s_abs, ext), blob)
                 processed_upto = e_abs
+                seen_hashes.add(digest)
                 counts[key] = counts.get(key, 0) + 1
                 saved += 1
                 preview = blob[:60].decode("ascii", "replace").replace("\n", " ")
                 w.writerow(["0x%x" % s_abs, len(blob), key, score, path, preview])
                 if saved % 200 == 0:
                     log("[src]   saved %d source fragments" % saved)
-    log("[src] DONE: %d fragments  %s" % (saved, dict(counts)))
+    log("[src] DONE: %d fragments (%d duplicates skipped)  %s" % (saved, dupes, dict(counts)))
     log("[src] manifest: %s" % man)
-    return {"saved": saved, "by_lang": counts}
+    return {"saved": saved, "duplicates_skipped": dupes, "by_lang": counts}
 
 
 # --------------------------------------------------------------------------- #
 #  Self-test: builds a synthetic image and proves every carver works           #
 # --------------------------------------------------------------------------- #
 
-def _build_mft_record(name, parent, content, rec_size=1024):
-    """Construct a minimal valid NTFS FILE record with resident $DATA."""
+def _build_mft_record(name, parent, content, rec_size=1024,
+                      record_no=0, flags=0x01):
+    """Construct a minimal valid NTFS FILE record with resident $DATA.
+    flags: 0x01 = file in use, 0x00 = deleted file, 0x03 = directory in use."""
     rec = bytearray(rec_size)
+    is_dir = bool(flags & 0x02)
     # --- attributes first, so we can compute first-attr offset = 0x38 ---
     attr_off = 0x38
     off = attr_off
@@ -1205,10 +1467,11 @@ def _build_mft_record(name, parent, content, rec_size=1024):
     rec[off:off + len(a)] = a
     off += len(a)
 
-    # $DATA (0x80) resident
-    a = put_attr(rec, ATTR_DATA, content)
-    rec[off:off + len(a)] = a
-    off += len(a)
+    # $DATA (0x80) resident -- directories have no unnamed data stream
+    if not is_dir:
+        a = put_attr(rec, ATTR_DATA, content)
+        rec[off:off + len(a)] = a
+        off += len(a)
 
     # end marker
     struct.pack_into("<I", rec, off, ATTR_END)
@@ -1221,9 +1484,10 @@ def _build_mft_record(name, parent, content, rec_size=1024):
     struct.pack_into("<H", rec, 0x10, 1)             # seq
     struct.pack_into("<H", rec, 0x12, 1)             # link count
     struct.pack_into("<H", rec, 0x14, attr_off)      # first attr
-    struct.pack_into("<H", rec, 0x16, 0x01)          # flags: in use, file
+    struct.pack_into("<H", rec, 0x16, flags)         # in-use / dir flags
     struct.pack_into("<I", rec, 0x18, used)
     struct.pack_into("<I", rec, 0x1C, rec_size)
+    struct.pack_into("<I", rec, 0x2C, record_no)     # MFT record number (3.1+)
 
     # Update Sequence Array: write USN at 0x30, fix sector tails
     usn = b"\x05\x05"
@@ -1238,6 +1502,8 @@ def _build_mft_record(name, parent, content, rec_size=1024):
 
 
 def selftest(outdir):
+    import tarfile
+
     os.makedirs(outdir, exist_ok=True)
     img_path = os.path.join(outdir, "synthetic.img")
     SIZE = 8 * MiB
@@ -1252,16 +1518,24 @@ def selftest(outdir):
     boot[0x40] = 0xF6                           # -10 -> record size 1024
     img[0:512] = boot
 
-    # 2) MFT at LCN 4 (offset 16384): one resident .rs and one .sol
+    # 2) MFT at LCN 4 (offset 16384): resident files, a directory tree
+    #    (src/main.rs -- exercises record-number path reconstruction), and a
+    #    DELETED file (in_use=0 -- the actual recovery scenario).
     mft_off = 4 * 4096
     rust_src = b'fn main() {\n    let mut x = 41;\n    x += 1;\n    println!("answer={}", x);\n}\n'
-    rec0 = _build_mft_record("answer.rs", 5, rust_src)
-    img[mft_off:mft_off + len(rec0)] = rec0
     sol_src = (b"// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n"
                b"contract Vault {\n    mapping(address => uint256) public balances;\n"
                b"    function deposit() external payable { balances[msg.sender] += msg.value; }\n}\n")
-    rec1 = _build_mft_record("Vault.sol", 5, sol_src)
-    img[mft_off + 1024:mft_off + 1024 + len(rec1)] = rec1
+    recs = [
+        _build_mft_record("answer.rs", 5, rust_src, record_no=16),
+        _build_mft_record("Vault.sol", 5, sol_src, record_no=17),
+        _build_mft_record("src", 5, b"", record_no=20, flags=0x03),       # directory
+        _build_mft_record("main.rs", 20, rust_src, record_no=21),        # inside src/
+        _build_mft_record("lost.py", 5, b"print('deleted but resident')\n",
+                          record_no=22, flags=0x00),                     # deleted
+    ]
+    for i, rec in enumerate(recs):
+        img[mft_off + i * 1024: mft_off + i * 1024 + len(rec)] = rec
 
     # 3) A real ZIP somewhere in the "data" area
     zbuf = io.BytesIO()
@@ -1272,15 +1546,78 @@ def selftest(outdir):
     zoff = 2 * MiB
     img[zoff:zoff + len(zbytes)] = zbytes
 
-    # 4) A loose Python source blob (no metadata) further along
+    # 3b) A streamed ZIP member (flag bit 3, sizes only in the data descriptor)
+    sm_name = b"stream/notes.md"
+    sm_raw = b"# Recovered notes\n\n- streamed zip member salvage works\n"
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    sm_data = co.compress(sm_raw) + co.flush()
+    lfh = struct.pack("<IHHHHHIIIHH", 0x04034b50, 20, 0x08, 8, 0, 0,
+                      0, 0, 0, len(sm_name), 0)
+    desc = struct.pack("<IIII", 0x08074b50, binascii.crc32(sm_raw) & 0xFFFFFFFF,
+                       len(sm_data), len(sm_raw))
+    streamed = lfh + sm_name + sm_data + desc
+    soff = 2 * MiB + 256 * KiB
+    img[soff:soff + len(streamed)] = streamed
+
+    # 3c) gzip / xz / bzip2 streams
+    payload = b"compressed recovery payload: " + b"0123456789abcdef" * 16
+    co = zlib.compressobj(9, zlib.DEFLATED, 31)        # gzip container
+    gz_blob = co.compress(payload) + co.flush()
+    goff = 2 * MiB + 512 * KiB
+    img[goff:goff + len(gz_blob)] = gz_blob
+    if lzma is not None:
+        xz_blob = lzma.compress(payload, format=lzma.FORMAT_XZ)
+        xoff = 2 * MiB + 768 * KiB
+        img[xoff:xoff + len(xz_blob)] = xz_blob
+    bz_blob = bz2.compress(payload)
+    boff = 3 * MiB
+    img[boff:boff + len(bz_blob)] = bz_blob
+
+    # 3d) A tar archive (member names + paths must survive)
+    tbuf = io.BytesIO()
+    with tarfile.open(fileobj=tbuf, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        for nm, data_ in (("proj/lib.rs", b"pub fn add(a: i32, b: i32) -> i32 { a + b }\n"),
+                          ("proj/app.py", b"def run():\n    return 42\n")):
+            ti = tarfile.TarInfo(nm)
+            ti.size = len(data_)
+            tf.addfile(ti, io.BytesIO(data_))
+    tar_blob = tbuf.getvalue()
+    toff = 3 * MiB + 256 * KiB
+    img[toff:toff + len(tar_blob)] = tar_blob
+
+    # 3e) A minimal 7z (valid signature header + CRC-checked next header)
+    nh = b"\x17\x06\x8d\x9b\xd5\x0f" + b"\x00" * 18
+    head = bytearray(32)
+    head[0:6] = b"7z\xbc\xaf\x27\x1c"
+    head[6:8] = b"\x00\x04"
+    struct.pack_into("<Q", head, 12, 0)               # next header right after
+    struct.pack_into("<Q", head, 20, len(nh))
+    struct.pack_into("<I", head, 28, binascii.crc32(nh) & 0xFFFFFFFF)
+    struct.pack_into("<I", head, 8, binascii.crc32(head[12:32]) & 0xFFFFFFFF)
+    z7off = 3 * MiB + 512 * KiB
+    img[z7off:z7off + 32 + len(nh)] = bytes(head) + nh
+
+    # 4) Loose source blobs (no metadata): python, java, typescript
     py_blob = (b"#!/usr/bin/env python3\nimport sys\n\n"
                b"def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n\n"
                b"if __name__ == '__main__':\n    print(fib(int(sys.argv[1])))\n") * 3
     poff = 4 * MiB
     img[poff:poff + len(py_blob)] = py_blob
+    java_blob = (b"import java.util.List;\n\npublic class Main {\n"
+                 b"    @Override\n    public String toString() { return \"demo\"; }\n"
+                 b"    public static void main(String[] args) {\n"
+                 b"        System.out.println(\"recovered\");\n    }\n}\n") * 2
+    joff = 4 * MiB + 512 * KiB
+    img[joff:joff + len(java_blob)] = java_blob
+    ts_blob = (b"export interface Config {\n    name: string;\n    retries: number;\n"
+               b"    readonly verbose: boolean;\n}\n\n"
+               b"export type Outcome = { ok: boolean };\n"
+               b"const defaults: Config = { name: 'x', retries: 3, verbose: false };\n") * 2
+    tsoff = 4 * MiB + 768 * KiB
+    img[tsoff:tsoff + len(ts_blob)] = ts_blob
 
-    # 5) A USN V2 delete record
-    def usn_rec(name, reason):
+    # 5) USN delete records: one V2 and one V3
+    def usn_rec_v2(name, reason):
         nm = name.encode("utf-16-le")
         body = bytearray(0x3C + len(nm))
         struct.pack_into("<H", body, 0x04, 2)        # major
@@ -1297,9 +1634,30 @@ def selftest(outdir):
         full[:len(body)] = body
         struct.pack_into("<I", full, 0, rlen)
         return bytes(full)
+
+    def usn_rec_v3(name, reason):
+        nm = name.encode("utf-16-le")
+        body = bytearray(0x4C + len(nm))
+        struct.pack_into("<H", body, 0x04, 3)        # major
+        struct.pack_into("<H", body, 0x06, 0)        # minor
+        struct.pack_into("<Q", body, 0x08, 200)      # file ref (low 8 of 16)
+        struct.pack_into("<Q", body, 0x18, 5)        # parent (low 8 of 16)
+        struct.pack_into("<Q", body, 0x30, 133000000000000000)  # filetime
+        struct.pack_into("<I", body, 0x38, reason)
+        struct.pack_into("<H", body, 0x48, len(nm))
+        struct.pack_into("<H", body, 0x4A, 0x4C)
+        body[0x4C:0x4C + len(nm)] = nm
+        rlen = (len(body) + 7) & ~7
+        full = bytearray(rlen)
+        full[:len(body)] = body
+        struct.pack_into("<I", full, 0, rlen)
+        return bytes(full)
+
     uoff = 6 * MiB
-    r = usn_rec("answer.rs", 0x200 | 0x80000000)      # FILE_DELETE|CLOSE
+    r = usn_rec_v2("answer.rs", 0x200 | 0x80000000)   # FILE_DELETE|CLOSE
     img[uoff:uoff + len(r)] = r
+    r3 = usn_rec_v3("Vault.sol", 0x200 | 0x80000000)
+    img[uoff + 1024:uoff + 1024 + len(r3)] = r3
 
     with open(img_path, "wb") as f:
         f.write(img)
@@ -1313,38 +1671,49 @@ def selftest(outdir):
     mres = mine_mft(reader, out, carve_nonresident=False, regions=None)
     ures = mine_usn(reader, out, regions=ex)
     zres = carve_zip(reader, out, regions=ex)
+    z7res = carve_7z(reader, out, regions=ex)
+    tres = carve_tar(reader, out, regions=ex)
+    gres = carve_gzip(reader, out, regions=ex)
+    xres = carve_xz(reader, out, regions=ex)
+    bres = carve_bzip2(reader, out, regions=ex)
     sres = carve_source(reader, out, regions=ex)
     reader.close()
 
     # assertions
     ok = True
+
+    def check(cond, what):
+        nonlocal ok
+        if cond:
+            log("[selftest] PASS: %s" % what)
+        else:
+            ok = False
+            log("[selftest] FAIL: %s" % what)
+
+    files_root = os.path.join(out, "10_mft", "files")
     files = []
-    for root, _, fs in os.walk(os.path.join(out, "10_mft", "files")):
+    for root, _, fs in os.walk(files_root):
         for fn in fs:
             files.append(fn)
-    if "answer.rs" not in files or "Vault.sol" not in files:
-        ok = False
-        log("[selftest] FAIL: resident MFT files not recovered: %s" % files)
-    else:
-        log("[selftest] PASS: resident MFT files recovered intact: answer.rs, Vault.sol")
-    if mres["resident_recovered"] < 2:
-        ok = False
-    if ures["deletes"] < 1:
-        ok = False
-        log("[selftest] FAIL: USN delete event not found")
-    else:
-        log("[selftest] PASS: USN FILE_DELETE recovered")
-    if zres["whole"] < 1:
-        ok = False
-        log("[selftest] FAIL: ZIP not reconstructed")
-    else:
-        log("[selftest] PASS: ZIP reconstructed (members extracted)")
+    check("answer.rs" in files and "Vault.sol" in files,
+          "resident MFT files recovered intact (answer.rs, Vault.sol)")
+    check("lost.py" in files, "DELETED resident file recovered (lost.py)")
+    check(os.path.isfile(os.path.join(files_root, "src", "main.rs")),
+          "directory path reconstructed from MFT record numbers (src/main.rs)")
+    check(mres["resident_recovered"] >= 4, "resident recovery count >= 4")
+    check(ures["deletes"] >= 2, "USN FILE_DELETE events found (V2 + V3)")
+    check(zres["whole"] >= 1, "ZIP reconstructed from EOCD (members extracted)")
+    check(zres["members"] >= 1, "streamed ZIP member salvaged via data descriptor")
+    check(z7res["count"] >= 1, "7z carved (CRC-validated header)")
+    check(tres["members"] >= 2, "tar members carved with original paths")
+    check(gres["count"] >= 1, "gzip stream decompressed")
+    if lzma is not None:
+        check(xres["count"] >= 1, "xz stream decompressed")
+    check(bres["count"] >= 1, "bzip2 stream decompressed")
     langs = sres["by_lang"]
-    if langs.get("python", 0) < 1:
-        ok = False
-        log("[selftest] FAIL: python source not carved (%s)" % langs)
-    else:
-        log("[selftest] PASS: source carving classified languages: %s" % langs)
+    check(langs.get("python", 0) >= 1, "python source carved (%s)" % langs)
+    check(langs.get("java", 0) >= 1, "java source carved")
+    check(langs.get("typescript", 0) >= 1, "typescript source carved")
 
     log("\n[selftest] %s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
@@ -1355,8 +1724,12 @@ def selftest(outdir):
 # --------------------------------------------------------------------------- #
 
 def write_summary(outdir, results):
+    jpath = os.path.join(outdir, "RECOVERY_SUMMARY.json")
+    with open(jpath, "w") as f:
+        json.dump({"version": __version__, "results": results}, f,
+                  indent=2, default=str)
     path = os.path.join(outdir, "RECOVERY_SUMMARY.txt")
-    lines = ["RECOVERY SUMMARY", "=" * 52, ""]
+    lines = ["RECOVERY SUMMARY  (engine v%s)" % __version__, "=" * 52, ""]
     for phase, res in results.items():
         lines.append("[%s]" % phase)
         for k, v in (res or {}).items():
@@ -1373,6 +1746,8 @@ def write_summary(outdir, results):
         "  20_archives/zip/       -> rebuilt .zip archives (members extracted)",
         "  20_archives/zip_members-> individual files salvaged from broken zips",
         "  20_archives/7z/        -> carved .7z archives (extract with: 7z x)",
+        "  20_archives/tar/       -> carved tar archives (members extracted)",
+        "  20_archives/{gzip,xz,bzip2}/ -> decompressed streams",
         "  30_source/<lang>/      -> source fragments grouped by language",
         "",
         "TIP: grep the whole output tree for a unique string you remember:",
@@ -1391,6 +1766,8 @@ def write_summary(outdir, results):
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="Read-only NTFS/NVMe source-code & archive recovery engine.")
+    p.add_argument("--version", action="version",
+                   version="nvme_recover %s" % __version__)
     sub = p.add_subparsers(dest="cmd")
 
     def add_common(sp):
@@ -1456,7 +1833,10 @@ def main(argv=None):
             ex = load_extents(reader, args.regions) if args.regions else None
             carve_zip(reader, args.out, regions=ex)
             carve_7z(reader, args.out, regions=ex)
+            carve_tar(reader, args.out, regions=ex)
             carve_gzip(reader, args.out, regions=ex)
+            carve_xz(reader, args.out, regions=ex)
+            carve_bzip2(reader, args.out, regions=ex)
         elif args.cmd == "source":
             ex = load_extents(reader, args.regions) if args.regions else None
             carve_source(reader, args.out, regions=ex,
@@ -1471,7 +1851,10 @@ def main(argv=None):
             results["usn"] = mine_usn(reader, args.out, regions=ex)
             results["zip"] = carve_zip(reader, args.out, regions=ex)
             results["7z"] = carve_7z(reader, args.out, regions=ex)
+            results["tar"] = carve_tar(reader, args.out, regions=ex)
             results["gzip"] = carve_gzip(reader, args.out, regions=ex)
+            results["xz"] = carve_xz(reader, args.out, regions=ex)
+            results["bzip2"] = carve_bzip2(reader, args.out, regions=ex)
             results["source"] = carve_source(reader, args.out, regions=ex)
             write_summary(args.out, results)
     finally:
