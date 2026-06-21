@@ -1,0 +1,78 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: nvme-recovery-linux
+          - os: windows-latest
+            artifact: nvme-recovery-windows
+          - os: macos-latest
+            artifact: nvme-recovery-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # setup-python's interpreter loads its bundled Tcl/Tk; install the system
+      # runtime as a hedge so _tkinter always resolves on the CI image.
+      - name: Install Tcl/Tk (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tk
+
+      - name: Smoke-test the engine (no GUI needed)
+        run: python nvme_recover.py selftest --out selftest_out
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build standalone binary
+        run: python build.py
+
+      - name: Verify the frozen binary runs (engine self-test)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./dist/nvme-recovery.exe --engine selftest --out frozen_selftest
+          else
+            ./dist/nvme-recovery --engine selftest --out frozen_selftest
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Show downloaded files
+        run: find artifacts -type f
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

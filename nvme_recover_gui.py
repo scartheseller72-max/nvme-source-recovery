@@ -49,7 +49,28 @@ ENGINE = os.path.join(HERE, "nvme_recover.py")
 TRIM_SCRIPT = os.path.join(HERE, "trim_control.py")
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
+FROZEN = getattr(sys, "frozen", False)
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".nvme_recover_gui.json")
+
+
+def resource_dir():
+    """Where bundled data (assets/) lives — the PyInstaller temp dir when frozen."""
+    return getattr(sys, "_MEIPASS", HERE)
+
+
+def engine_argv(*args):
+    """argv to run the recovery engine, working both as a .py and as a frozen exe.
+    When frozen, the GUI re-invokes its own executable with a --engine switch."""
+    if FROZEN:
+        return [sys.executable, "--engine", *args]
+    return [sys.executable, ENGINE, *args]
+
+
+def trim_argv(*args):
+    if FROZEN:
+        return [sys.executable, "--trim", *args]
+    return [sys.executable, TRIM_SCRIPT, *args]
+
 
 # Phase id -> (label, engine subcommand, tooltip)
 PHASES = [
@@ -313,7 +334,7 @@ class App(object):
 
     def _set_icon(self):
         for name in ("mark.png", "logo.png"):
-            p = os.path.join(HERE, "assets", name)
+            p = os.path.join(resource_dir(), "assets", name)
             if os.path.isfile(p):
                 try:
                     self._icon = tk.PhotoImage(file=p)
@@ -727,7 +748,7 @@ class App(object):
         if not out:
             messagebox.showerror("Output missing", "Choose an output directory.")
             return None
-        if not os.path.isfile(ENGINE):
+        if not FROZEN and not os.path.isfile(ENGINE):
             messagebox.showerror("Engine missing",
                                  "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
             return None
@@ -764,7 +785,7 @@ class App(object):
 
         jobs = []
         for cmd in cmds:
-            argv = [sys.executable, ENGINE, cmd, "--image", src, "--out", out]
+            argv = engine_argv(cmd, "--image", src, "--out", out)
             if cmd in ("mft",) and self.opt_carve.get():
                 argv.append("--carve-nonresident")
             if cmd == "source" and self.opt_unclass.get():
@@ -779,7 +800,7 @@ class App(object):
     def _run_selftest(self):
         out = self.out_var.get().strip() or os.path.join(HERE, "_selftest")
         out = os.path.join(out, "_selftest") if os.path.basename(out) != "_selftest" else out
-        argv = [sys.executable, ENGINE, "selftest", "--out", out]
+        argv = engine_argv("selftest", "--out", out)
         self.last_out = os.path.join(out, "out")
         self._start_jobs([("Self-test", argv)])
 
@@ -790,7 +811,7 @@ class App(object):
             messagebox.showerror("Source missing",
                                  "Select the disk / device (or an image) to copy first.")
             return
-        if not os.path.isfile(ENGINE):
+        if not FROZEN and not os.path.isfile(ENGINE):
             messagebox.showerror("Engine missing",
                                  "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
             return
@@ -811,14 +832,14 @@ class App(object):
                     "The source is opened READ-ONLY and never modified.%s\n\nProceed?"
                     % (src, dest, note)):
                 return
-        argv = [sys.executable, ENGINE, "image", "--image", src, "--dest", dest]
+        argv = engine_argv("image", "--image", src, "--dest", dest)
         self._after_image_dest = dest
         self.last_out = os.path.dirname(dest) or None
         self._start_jobs([("Image drive", argv)])
 
     # -- TRIM control ------------------------------------------------------ #
     def _trim(self, action):
-        if not os.path.isfile(TRIM_SCRIPT):
+        if not FROZEN and not os.path.isfile(TRIM_SCRIPT):
             messagebox.showerror("Missing", "trim_control.py not found next to the GUI.")
             return
         if action == "disable":
@@ -842,7 +863,7 @@ class App(object):
 
     def _trim_worker(self, action):
         try:
-            r = subprocess.run([sys.executable, TRIM_SCRIPT, action],
+            r = subprocess.run(trim_argv(action),
                                capture_output=True, text=True, timeout=90)
             out = (r.stdout or "") + (r.stderr or "")
             rc = r.returncode
@@ -1208,6 +1229,14 @@ class App(object):
 
 
 def main():
+    # When frozen, the single executable doubles as the engine and trim tool so
+    # the GUI can re-invoke itself (no separate .py files ship with the binary).
+    if len(sys.argv) >= 2 and sys.argv[1] == "--engine":
+        import nvme_recover
+        sys.exit(nvme_recover.main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--trim":
+        import trim_control
+        sys.exit(trim_control.main(sys.argv[2:]))
     root = tk.Tk()
     App(root)
     root.mainloop()

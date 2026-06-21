@@ -202,6 +202,29 @@ command for your distro (`sudo apt install -y python3-tk` on Debian/Ubuntu).
 
 ---
 
+## Standalone builds (no Python install needed)
+
+Every push is built into a single self-contained executable for **Windows,
+Linux, and macOS** by GitHub Actions (`.github/workflows/build.yml`) — grab one
+from the run's **Artifacts**, or from the **Releases** page for tagged versions.
+The one binary doubles as the GUI, the recovery engine, and the TRIM tool (it
+re-invokes itself with `--engine` / `--trim`), so there's nothing else to copy.
+
+Build it yourself for your current OS (PyInstaller does not cross-compile):
+
+```bash
+python3 -m pip install pyinstaller
+python3 build.py            # -> dist/nvme-recovery  (or .exe / .app)
+```
+
+To cut a versioned release with binaries attached, push a tag:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+---
+
 ## Requirements
 
 For the **safest** recovery, run from a **Linux live USB** (SystemRescue /
@@ -369,6 +392,8 @@ nvme-source-recovery/
 +-- nvme_recover.py        recovery engine (MFT + USN + archives + media + source)
 +-- nvme_recover_gui.py    desktop GUI front-end (tkinter, stdlib-only)
 +-- trim_control.py        query / disable / enable SSD TRIM (Win/Linux/macOS)
++-- build.py               build a standalone executable (PyInstaller)
++-- .github/workflows/     CI: cross-platform binary builds + releases
 +-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture (Linux)
 +-- 02_run_recovery.sh     one-command pipeline runner (Linux/macOS)
 +-- 03_recover_gui.sh      launches the GUI (Linux/macOS)
