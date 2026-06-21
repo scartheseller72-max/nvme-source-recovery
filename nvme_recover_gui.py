@@ -20,13 +20,14 @@ so a long scan never freezes the UI and the engine stays untouched.
 """
 
 import os
+import re
 import sys
 import csv
 import glob
 import json
+import time
 import queue
 import shlex
-import signal
 import threading
 import subprocess
 
@@ -45,6 +46,31 @@ except Exception as exc:                                    # pragma: no cover
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.join(HERE, "nvme_recover.py")
+TRIM_SCRIPT = os.path.join(HERE, "trim_control.py")
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+FROZEN = getattr(sys, "frozen", False)
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".nvme_recover_gui.json")
+
+
+def resource_dir():
+    """Where bundled data (assets/) lives — the PyInstaller temp dir when frozen."""
+    return getattr(sys, "_MEIPASS", HERE)
+
+
+def engine_argv(*args):
+    """argv to run the recovery engine, working both as a .py and as a frozen exe.
+    When frozen, the GUI re-invokes its own executable with a --engine switch."""
+    if FROZEN:
+        return [sys.executable, "--engine", *args]
+    return [sys.executable, ENGINE, *args]
+
+
+def trim_argv(*args):
+    if FROZEN:
+        return [sys.executable, "--trim", *args]
+    return [sys.executable, TRIM_SCRIPT, *args]
+
 
 # Phase id -> (label, engine subcommand, tooltip)
 PHASES = [
@@ -93,13 +119,63 @@ def human(n):
     return "%.1f PiB" % n
 
 
-def detect_block_devices():
-    """Return [(path, label)] for likely source devices. Best-effort, read-only."""
+def open_path(path):
+    """Open a file or folder with the OS default handler. Cross-platform."""
+    try:
+        if IS_WINDOWS:
+            os.startfile(path)                          # noqa: type checker
+        elif IS_MAC:
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
+def _detect_windows():
     out = []
     try:
-        res = subprocess.run(
-            ["lsblk", "-dpno", "NAME,SIZE,MODEL,TYPE"],
-            capture_output=True, text=True, timeout=5)
+        ps = ("Get-CimInstance Win32_DiskDrive | ForEach-Object "
+              "{ \"$($_.DeviceID)|$($_.Size)|$($_.Model)\" }")
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=10)
+        for line in res.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) < 2 or not parts[0].strip():
+                continue
+            dev = parts[0].strip()                      # \\.\PHYSICALDRIVE0
+            size = parts[1].strip()
+            model = parts[2].strip() if len(parts) > 2 else ""
+            hs = human(int(size)) if size.isdigit() else size
+            out.append((dev, "%s  (%s%s)" % (dev, hs, "  " + model if model else "")))
+    except Exception:
+        pass
+    return out
+
+
+def _detect_macos():
+    out = []
+    try:
+        res = subprocess.run(["diskutil", "list"], capture_output=True,
+                             text=True, timeout=8)
+        for line in res.stdout.splitlines():
+            m = re.match(r"^(/dev/disk\d+)\b", line)
+            if m:
+                out.append((m.group(1), line.strip()))
+    except Exception:
+        pass
+    if not out:
+        for dev in sorted(glob.glob("/dev/disk[0-9]")):
+            out.append((dev, dev))
+    return out
+
+
+def _detect_linux():
+    out = []
+    try:
+        res = subprocess.run(["lsblk", "-dpno", "NAME,SIZE,MODEL,TYPE"],
+                             capture_output=True, text=True, timeout=5)
         if res.returncode == 0:
             for line in res.stdout.splitlines():
                 parts = line.split(None, 3)
@@ -109,17 +185,41 @@ def detect_block_devices():
                 typ = parts[3] if len(parts) > 3 else ""
                 model = parts[2] if len(parts) > 2 else ""
                 if "disk" in (typ.lower() if typ else "") or "disk" in line.lower():
-                    label = "%s  (%s%s)" % (name, size, "  " + model if model else "")
-                    out.append((name, label))
+                    out.append((name, "%s  (%s%s)" % (name, size,
+                                "  " + model if model else "")))
             if out:
                 return out
     except Exception:
         pass
-    # Fallback: glob common device nodes
     for pat in ("/dev/nvme*n[0-9]", "/dev/sd[a-z]"):
         for dev in sorted(glob.glob(pat)):
             out.append((dev, dev))
     return out
+
+
+def detect_block_devices():
+    """Return [(path, label)] for likely source devices. Best-effort, read-only."""
+    if IS_WINDOWS:
+        return _detect_windows()
+    if IS_MAC:
+        return _detect_macos()
+    return _detect_linux()
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 def count_csv_rows(path):
@@ -157,7 +257,7 @@ class Runner(object):
         p = self.proc
         if p and p.poll() is None:
             try:
-                p.send_signal(signal.SIGTERM)
+                p.terminate()                           # cross-platform
             except Exception:
                 pass
 
@@ -207,18 +307,82 @@ class App(object):
         self.runner = Runner(self.q)
         self.phase_vars = {}
         self.last_out = None
+        self.settings = load_settings()
+        self._after_image_dest = None
+        self._start_ts = None
+        self._phase_idx = 0
+        self._phase_total = 0
+        self._cur_phase = ""
 
         root.title("NVMe Source Recovery")
         root.configure(bg=BG)
-        root.geometry("1100x720")
-        root.minsize(900, 600)
+        root.geometry("1180x760")
+        root.minsize(940, 620)
 
         self._init_fonts()
         self._init_style()
+        self._set_icon()
+        self._build_menu()
         self._build()
+        self._apply_settings()
         self._refresh_devices()
+        self._bind_keys()
+        self._tick()
         self.root.after(80, self._pump)
+        self.root.after(300, lambda: self._trim("status"))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_icon(self):
+        for name in ("mark.png", "logo.png"):
+            p = os.path.join(resource_dir(), "assets", name)
+            if os.path.isfile(p):
+                try:
+                    self._icon = tk.PhotoImage(file=p)
+                    self.root.iconphoto(True, self._icon)
+                    return
+                except Exception:
+                    continue
+
+    def _build_menu(self):
+        bar = tk.Menu(self.root)
+        filem = tk.Menu(bar, tearoff=0)
+        filem.add_command(label="Open output folder", command=self._open_output,
+                          accelerator="Ctrl+O")
+        filem.add_command(label="Save log…", command=self._save_log,
+                          accelerator="Ctrl+S")
+        filem.add_separator()
+        filem.add_command(label="Quit", command=self._on_close, accelerator="Ctrl+Q")
+        bar.add_cascade(label="File", menu=filem)
+        runm = tk.Menu(bar, tearoff=0)
+        runm.add_command(label="Image drive… (create .img)", command=self._image_drive)
+        runm.add_separator()
+        runm.add_command(label="Run selected", command=self._run_selected,
+                         accelerator="Ctrl+R")
+        runm.add_command(label="Stop", command=self._stop, accelerator="Esc")
+        runm.add_command(label="Self-test", command=self._run_selftest)
+        runm.add_separator()
+        runm.add_command(label="Refresh results", command=self._load_results,
+                         accelerator="F5")
+        bar.add_cascade(label="Run", menu=runm)
+        toolsm = tk.Menu(bar, tearoff=0)
+        toolsm.add_command(label="TRIM status", command=lambda: self._trim("status"))
+        toolsm.add_command(label="Disable TRIM (protect data)",
+                           command=lambda: self._trim("disable"))
+        toolsm.add_command(label="Enable TRIM (restore)",
+                           command=lambda: self._trim("enable"))
+        bar.add_cascade(label="Tools", menu=toolsm)
+        helpm = tk.Menu(bar, tearoff=0)
+        helpm.add_command(label="About", command=self._about)
+        bar.add_cascade(label="Help", menu=helpm)
+        self.root.config(menu=bar)
+
+    def _bind_keys(self):
+        self.root.bind("<Control-r>", lambda e: self._run_selected())
+        self.root.bind("<Control-o>", lambda e: self._open_output())
+        self.root.bind("<Control-s>", lambda e: self._save_log())
+        self.root.bind("<Control-q>", lambda e: self._on_close())
+        self.root.bind("<F5>", lambda e: self._load_results())
+        self.root.bind("<Escape>", lambda e: self._stop())
 
     # -- styling ----------------------------------------------------------- #
     def _init_fonts(self):
@@ -255,8 +419,23 @@ class App(object):
         st.map("Accent.TButton",
                background=[("active", "#5aa0ea"), ("disabled", BORDER)],
                foreground=[("disabled", FG_MUTE)])
-        st.configure("TCheckbutton", background=BG_PANEL, foreground=FG)
-        st.map("TCheckbutton", background=[("active", BG_PANEL)])
+        # Checkbuttons: make the tick state unmistakable on a dark theme.
+        # Unchecked = dark box with a visible border; checked = filled accent box.
+        for cb_style in ("TCheckbutton", "Phase.TCheckbutton"):
+            st.configure(cb_style, background=BG_PANEL, foreground=FG,
+                         focuscolor=BG_PANEL, indicatorbackground=BG_INPUT,
+                         indicatorforeground=ACCENT, indicatorcolor=BG_INPUT,
+                         bordercolor=BORDER, indicatormargin=4)
+            st.map(cb_style,
+                   background=[("active", BG_PANEL)],
+                   foreground=[("disabled", FG_MUTE)],
+                   indicatorbackground=[("selected", ACCENT),
+                                        ("active", "#1b2937")],
+                   indicatorforeground=[("selected", "#06121f")],
+                   indicatorcolor=[("selected", ACCENT), ("active", "#1b2937")],
+                   bordercolor=[("selected", ACCENT), ("active", ACCENT)])
+        st.configure("Phase.TCheckbutton", font=self.f_h2)
+        st.configure("Footer.TFrame", background=BG_INPUT)
         st.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG,
                      insertcolor=FG, bordercolor=BORDER)
         st.configure("TCombobox", fieldbackground=BG_INPUT, foreground=FG,
@@ -297,68 +476,139 @@ class App(object):
         self._build_statusbar()
 
     def _build_left(self, parent):
-        left = ttk.Frame(parent, style="Panel.TFrame", padding=14)
+        # Outer panel: row 0 = scrollable config, row 1 = sticky action footer.
+        left = ttk.Frame(parent, style="Panel.TFrame")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
 
-        # Source
-        ttk.Label(left, text="SOURCE  (image or device)", style="H2.TLabel").pack(anchor="w")
-        srow = ttk.Frame(left, style="Panel.TFrame")
+        canvas = tk.Canvas(left, bg=BG_PANEL, highlightthickness=0, borderwidth=0)
+        vsb = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        inner = ttk.Frame(canvas, style="Panel.TFrame", padding=(14, 14, 8, 14))
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        self._bind_wheel(canvas)
+
+        # --- Source ---
+        ttk.Label(inner, text="SOURCE  (image or device)", style="H2.TLabel").pack(anchor="w")
+        srow = ttk.Frame(inner, style="Panel.TFrame")
         srow.pack(fill="x", pady=(4, 2))
         self.src_var = tk.StringVar()
         self.src_combo = ttk.Combobox(srow, textvariable=self.src_var)
         self.src_combo.pack(side="left", fill="x", expand=True)
         ttk.Button(srow, text="↻", width=3, command=self._refresh_devices).pack(side="left", padx=(4, 0))
-        brow = ttk.Frame(left, style="Panel.TFrame")
+        brow = ttk.Frame(inner, style="Panel.TFrame")
         brow.pack(fill="x")
         ttk.Button(brow, text="Browse image…", command=self._pick_image).pack(side="left")
-        ttk.Label(left, text="Pick a forensic .img, or a /dev node (opened read-only).",
-                  style="PanelMute.TLabel", wraplength=300, justify="left").pack(anchor="w", pady=(2, 10))
+        ttk.Button(brow, text="① Image drive → .img",
+                   command=self._image_drive).pack(side="left", padx=(6, 0))
+        dev_hint = ("Pick a forensic .img, or a detected disk "
+                    "(\\\\.\\PhysicalDriveN — run as Administrator).\n"
+                    "Tip: image the drive first, then recover from the safe copy." if IS_WINDOWS
+                    else "Pick a forensic .img, or a detected device (opened read-only).\n"
+                    "Tip: image the drive first, then recover from the safe copy.")
+        ttk.Label(inner, text=dev_hint, style="PanelMute.TLabel",
+                  wraplength=300, justify="left").pack(anchor="w", pady=(2, 12))
 
-        # Output
-        ttk.Label(left, text="OUTPUT DIRECTORY", style="H2.TLabel").pack(anchor="w")
-        orow = ttk.Frame(left, style="Panel.TFrame")
+        # --- Output ---
+        ttk.Label(inner, text="OUTPUT DIRECTORY", style="H2.TLabel").pack(anchor="w")
+        orow = ttk.Frame(inner, style="Panel.TFrame")
         orow.pack(fill="x", pady=(4, 2))
         self.out_var = tk.StringVar()
         ttk.Entry(orow, textvariable=self.out_var).pack(side="left", fill="x", expand=True)
         ttk.Button(orow, text="Browse…", command=self._pick_out).pack(side="left", padx=(4, 0))
-        ttk.Label(left, text="Recovered files & manifests are written here.",
-                  style="PanelMute.TLabel").pack(anchor="w", pady=(2, 10))
+        ttk.Label(inner, text="Recovered files & manifests are written here.",
+                  style="PanelMute.TLabel").pack(anchor="w", pady=(2, 12))
 
-        # Phases
-        ttk.Label(left, text="PHASES", style="H2.TLabel").pack(anchor="w")
+        # --- Phases ---
+        phdr = ttk.Frame(inner, style="Panel.TFrame")
+        phdr.pack(fill="x")
+        ttk.Label(phdr, text="PHASES", style="H2.TLabel").pack(side="left")
+        ttk.Button(phdr, text="none", width=5,
+                   command=lambda: self._set_all_phases(False)).pack(side="right")
+        ttk.Button(phdr, text="all", width=4,
+                   command=lambda: self._set_all_phases(True)).pack(side="right", padx=(0, 4))
         for pid, label, _cmd, tip in PHASES:
             v = tk.BooleanVar(value=True)
             self.phase_vars[pid] = v
-            cb = ttk.Checkbutton(left, text=label, variable=v)
-            cb.pack(anchor="w", pady=(3, 0))
-            ttk.Label(left, text=tip, style="PanelMute.TLabel",
-                      wraplength=300, justify="left").pack(anchor="w", padx=(22, 0))
+            cb = ttk.Checkbutton(inner, text=label, variable=v, style="Phase.TCheckbutton")
+            cb.pack(anchor="w", pady=(5, 0))
+            ttk.Label(inner, text=tip, style="PanelMute.TLabel",
+                      wraplength=296, justify="left").pack(anchor="w", padx=(24, 0))
 
-        # Options
-        ttk.Label(left, text="OPTIONS", style="H2.TLabel").pack(anchor="w", pady=(10, 0))
+        # --- Options ---
+        ttk.Label(inner, text="OPTIONS", style="H2.TLabel").pack(anchor="w", pady=(12, 0))
         self.opt_carve = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Carve non-resident file bodies",
-                        variable=self.opt_carve).pack(anchor="w", pady=(3, 0))
-        ttk.Label(left, text="Pull data from cluster runs (may be zeros if TRIMed).",
-                  style="PanelMute.TLabel", wraplength=300,
-                  justify="left").pack(anchor="w", padx=(22, 0))
+        ttk.Checkbutton(inner, text="Carve non-resident file bodies",
+                        variable=self.opt_carve).pack(anchor="w", pady=(5, 0))
+        ttk.Label(inner, text="Pull data from cluster runs (may be zeros if TRIMed).",
+                  style="PanelMute.TLabel", wraplength=296,
+                  justify="left").pack(anchor="w", padx=(24, 0))
         self.opt_unclass = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Keep unclassified text blobs",
-                        variable=self.opt_unclass).pack(anchor="w", pady=(3, 0))
+        ttk.Checkbutton(inner, text="Keep unclassified text blobs",
+                        variable=self.opt_unclass).pack(anchor="w", pady=(5, 0))
 
-        # Run buttons
-        btns = ttk.Frame(left, style="Panel.TFrame")
-        btns.pack(fill="x", pady=(14, 0))
-        self.run_btn = ttk.Button(btns, text="▶  Run", style="Accent.TButton",
+        # --- TRIM protection ---
+        ttk.Label(inner, text="TRIM PROTECTION", style="H2.TLabel").pack(anchor="w", pady=(12, 0))
+        self.trim_status = ttk.Label(inner, text="TRIM: checking…",
+                                     style="PanelMute.TLabel")
+        self.trim_status.pack(anchor="w", pady=(2, 4))
+        trow = ttk.Frame(inner, style="Panel.TFrame")
+        trow.pack(fill="x")
+        ttk.Button(trow, text="Check",
+                   command=lambda: self._trim("status")).pack(side="left")
+        ttk.Button(trow, text="Disable (protect)",
+                   command=lambda: self._trim("disable")).pack(side="left", padx=(6, 0))
+        ttk.Button(trow, text="Enable (restore)",
+                   command=lambda: self._trim("enable")).pack(side="left", padx=(6, 0))
+        ttk.Label(inner, text="System-wide; affects all SSDs and needs admin/root. "
+                  "Disable BEFORE connecting the damaged drive. Only stops FUTURE "
+                  "erasure — already-TRIMed data is gone.",
+                  style="PanelMute.TLabel", wraplength=296,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+
+        # --- Sticky action footer (always visible, never scrolls) ---
+        footer = ttk.Frame(left, style="Footer.TFrame", padding=(12, 10))
+        footer.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.run_btn = ttk.Button(footer, text="▶  RUN RECOVERY", style="Accent.TButton",
                                   command=self._run_selected)
-        self.run_btn.pack(side="left", fill="x", expand=True)
-        self.stop_btn = ttk.Button(btns, text="■ Stop", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.run_btn.pack(fill="x")
+        row2 = ttk.Frame(footer, style="Footer.TFrame")
+        row2.pack(fill="x", pady=(6, 0))
+        self.stop_btn = ttk.Button(row2, text="■ Stop", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", fill="x", expand=True)
+        ttk.Button(row2, text="Self-test", command=self._run_selftest).pack(side="left", padx=(6, 0), fill="x", expand=True)
+        ttk.Button(row2, text="Open output", command=self._open_output).pack(side="left", padx=(6, 0), fill="x", expand=True)
 
-        extra = ttk.Frame(left, style="Panel.TFrame")
-        extra.pack(fill="x", pady=(6, 0))
-        ttk.Button(extra, text="Self-test", command=self._run_selftest).pack(side="left", fill="x", expand=True)
-        ttk.Button(extra, text="Open output", command=self._open_output).pack(side="left", padx=(6, 0), fill="x", expand=True)
+    def _bind_wheel(self, canvas):
+        def _on_wheel(event):
+            if event.num == 4:                          # Linux scroll up
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:                        # Linux scroll down
+                canvas.yview_scroll(1, "units")
+            else:                                       # Windows / macOS
+                canvas.yview_scroll(int(-event.delta / 120) or
+                                    (-1 if event.delta > 0 else 1), "units")
+
+        def _enter(_e):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _leave(_e):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _enter)
+        canvas.bind("<Leave>", _leave)
 
     def _build_right(self, parent):
         self.nb = ttk.Notebook(parent)
@@ -413,8 +663,19 @@ class App(object):
         split.pack(fill="both", expand=True)
 
         treebox = ttk.Frame(split)
-        self.tree = ttk.Treeview(treebox, show="tree", selectmode="browse")
-        tsb = ttk.Scrollbar(treebox, orient="vertical", command=self.tree.yview)
+        frow = ttk.Frame(treebox)
+        frow.pack(fill="x", pady=(0, 4))
+        ttk.Label(frow, text="Filter:", style="Mute.TLabel").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self._apply_filter())
+        ttk.Entry(frow, textvariable=self.filter_var).pack(side="left", fill="x",
+                                                           expand=True, padx=(4, 6))
+        self.tree_count = ttk.Label(frow, text="", style="Mute.TLabel")
+        self.tree_count.pack(side="right")
+        treerow = ttk.Frame(treebox)
+        treerow.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(treerow, show="tree", selectmode="browse")
+        tsb = ttk.Scrollbar(treerow, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
         tsb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
@@ -444,6 +705,8 @@ class App(object):
         bar.pack(fill="x")
         self.pbar = ttk.Progressbar(bar, mode="determinate", maximum=100)
         self.pbar.pack(side="left", fill="x", expand=True)
+        self.timing = ttk.Label(bar, text="", style="Mute.TLabel")
+        self.timing.pack(side="left", padx=(10, 0))
         self.status = ttk.Label(bar, text="Ready.", style="Mute.TLabel")
         self.status.pack(side="left", padx=10)
 
@@ -471,25 +734,32 @@ class App(object):
     def _selected_phase_cmds(self):
         return [cmd for pid, _l, cmd, _t in PHASES if self.phase_vars[pid].get()]
 
+    def _is_device(self, src):
+        return src.startswith(("/dev/", "\\\\.\\", "\\\\?\\"))
+
     def _validate(self):
         src = self.src_var.get().strip()
         out = self.out_var.get().strip()
-        if not src or not os.path.exists(src):
+        is_dev = self._is_device(src)
+        if not src or (not is_dev and not os.path.exists(src)):
             messagebox.showerror("Source missing",
                                  "Select a valid image file or device first.")
             return None
         if not out:
             messagebox.showerror("Output missing", "Choose an output directory.")
             return None
-        if not os.path.isfile(ENGINE):
+        if not FROZEN and not os.path.isfile(ENGINE):
             messagebox.showerror("Engine missing",
                                  "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
             return None
-        if src.startswith("/dev/"):
+        if is_dev:
+            note = ("\n\nWindows: this GUI must be started as Administrator to read it."
+                    if IS_WINDOWS else "")
             if not messagebox.askyesno(
                     "Run against a live device?",
-                    "%s is a block device.\n\nThe engine opens it READ-ONLY, but the "
-                    "recommended workflow is to image it first.\n\nContinue read-only?" % src):
+                    "%s is a physical device.\n\nThe engine opens it READ-ONLY, but the "
+                    "recommended workflow is to image it first.%s\n\nContinue read-only?"
+                    % (src, note)):
                 return None
         return src, out
 
@@ -515,7 +785,7 @@ class App(object):
 
         jobs = []
         for cmd in cmds:
-            argv = [sys.executable, ENGINE, cmd, "--image", src, "--out", out]
+            argv = engine_argv(cmd, "--image", src, "--out", out)
             if cmd in ("mft",) and self.opt_carve.get():
                 argv.append("--carve-nonresident")
             if cmd == "source" and self.opt_unclass.get():
@@ -530,20 +800,105 @@ class App(object):
     def _run_selftest(self):
         out = self.out_var.get().strip() or os.path.join(HERE, "_selftest")
         out = os.path.join(out, "_selftest") if os.path.basename(out) != "_selftest" else out
-        argv = [sys.executable, ENGINE, "selftest", "--out", out]
+        argv = engine_argv("selftest", "--out", out)
         self.last_out = os.path.join(out, "out")
         self._start_jobs([("Self-test", argv)])
+
+    def _image_drive(self):
+        """Create a read-only raw image of the selected disk/partition first."""
+        src = self.src_var.get().strip()
+        if not src or (not self._is_device(src) and not os.path.exists(src)):
+            messagebox.showerror("Source missing",
+                                 "Select the disk / device (or an image) to copy first.")
+            return
+        if not FROZEN and not os.path.isfile(ENGINE):
+            messagebox.showerror("Engine missing",
+                                 "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
+            return
+        initial = (self.out_var.get().strip() or os.path.expanduser("~"))
+        dest = filedialog.asksaveasfilename(
+            title="Save disk image as…", defaultextension=".img",
+            initialdir=initial if os.path.isdir(initial) else os.path.expanduser("~"),
+            initialfile="rescue.img",
+            filetypes=[("Raw disk image", "*.img"), ("All files", "*")])
+        if not dest:
+            return
+        if self._is_device(src):
+            note = ("\n\nWindows: the GUI must be running as Administrator to read it."
+                    if IS_WINDOWS else "")
+            if not messagebox.askyesno(
+                    "Create read-only image?",
+                    "Read %s and write a full image to:\n%s\n\n"
+                    "The source is opened READ-ONLY and never modified.%s\n\nProceed?"
+                    % (src, dest, note)):
+                return
+        argv = engine_argv("image", "--image", src, "--dest", dest)
+        self._after_image_dest = dest
+        self.last_out = os.path.dirname(dest) or None
+        self._start_jobs([("Image drive", argv)])
+
+    # -- TRIM control ------------------------------------------------------ #
+    def _trim(self, action):
+        if not FROZEN and not os.path.isfile(TRIM_SCRIPT):
+            messagebox.showerror("Missing", "trim_control.py not found next to the GUI.")
+            return
+        if action == "disable":
+            if not messagebox.askyesno(
+                    "Disable TRIM?",
+                    "Turn TRIM OFF system-wide to protect deleted data from further "
+                    "erasure?\n\n• Affects ALL SSDs on this machine.\n"
+                    "• Changes an OS setting, not any drive's contents.\n"
+                    "• Only prevents FUTURE erasure — already-TRIMed data is gone.\n"
+                    "• Needs %s.\n\nProceed?" % ("Administrator" if IS_WINDOWS else "root/sudo")):
+                return
+        elif action == "enable":
+            if not messagebox.askyesno(
+                    "Enable TRIM?",
+                    "Turn TRIM back ON system-wide?\n\nDo this only AFTER you have "
+                    "finished recovering — it lets the SSD erase freed blocks again "
+                    "(good for performance/longevity).\n\nProceed?"):
+                return
+        self._set_status("TRIM: running %s…" % action)
+        threading.Thread(target=self._trim_worker, args=(action,), daemon=True).start()
+
+    def _trim_worker(self, action):
+        try:
+            r = subprocess.run(trim_argv(action),
+                               capture_output=True, text=True, timeout=90)
+            out = (r.stdout or "") + (r.stderr or "")
+            rc = r.returncode
+        except Exception as exc:
+            out, rc = str(exc), 1
+        state = "UNKNOWN"
+        for line in out.splitlines():
+            if line.startswith("TRIM_STATE:"):
+                state = line.split(":", 1)[1].strip()
+        self.q.put(("trim_result", (action, rc, out, state)))
+
+    def _update_trim_label(self, state):
+        text = {
+            "DISABLED": "TRIM: OFF — safe for recovery",
+            "ENABLED": "TRIM: ON — disable before recovery",
+            "MIXED": "TRIM: MIXED — some volumes still trimming",
+            "UNKNOWN": "TRIM: unknown (need admin/root to read?)",
+        }.get(state, "TRIM: " + state)
+        color = {"DISABLED": OK, "ENABLED": WARN, "MIXED": WARN}.get(state, FG_MUTE)
+        self.trim_status.configure(text=text, foreground=color)
 
     def _start_jobs(self, jobs):
         if self.runner.is_running():
             messagebox.showinfo("Busy", "A recovery is already running.")
             return
+        self._save_state()
         self._clear_log()
         self._append("phase", "Starting %d phase(s)…\n" % len(jobs))
         self.run_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.pbar.configure(mode="indeterminate")
         self.pbar.start(12)
+        self._start_ts = time.time()
+        self._phase_idx = 0
+        self._phase_total = len(jobs)
         self.nb.select(0)
         self.runner.start(jobs)
 
@@ -557,13 +912,83 @@ class App(object):
         if not path or not os.path.isdir(path):
             messagebox.showinfo("Nothing yet", "No output directory to open.")
             return
-        for opener in ("xdg-open", "open"):
-            try:
-                subprocess.Popen([opener, path])
-                return
-            except Exception:
-                continue
-        messagebox.showinfo("Output", path)
+        if not open_path(path):
+            messagebox.showinfo("Output", path)
+
+    # -- settings, phases, timing, filter, log save ------------------------ #
+    def _apply_settings(self):
+        s = self.settings
+        if s.get("source"):
+            self.src_var.set(s["source"])
+        if s.get("out"):
+            self.out_var.set(s["out"])
+        for pid, var in self.phase_vars.items():
+            if pid in s.get("phases", {}):
+                var.set(bool(s["phases"][pid]))
+        self.opt_carve.set(bool(s.get("carve", False)))
+        self.opt_unclass.set(bool(s.get("unclassified", False)))
+
+    def _save_state(self):
+        save_settings({
+            "source": self.src_var.get().strip(),
+            "out": self.out_var.get().strip(),
+            "phases": {pid: var.get() for pid, var in self.phase_vars.items()},
+            "carve": self.opt_carve.get(),
+            "unclassified": self.opt_unclass.get(),
+        })
+
+    def _set_all_phases(self, value):
+        for var in self.phase_vars.values():
+            var.set(value)
+
+    def _tick(self):
+        if self._start_ts is not None:
+            el = int(time.time() - self._start_ts)
+            phase = "%d/%d" % (self._phase_idx, self._phase_total) \
+                if self._phase_total else ""
+            self.timing.configure(text="⏱ %02d:%02d   phase %s%s" % (
+                el // 60, el % 60, phase,
+                "  ·  " + self._cur_phase if self._cur_phase else ""))
+        self.root.after(500, self._tick)
+
+    def _apply_filter(self):
+        needle = self.filter_var.get().strip().lower()
+        if not needle:
+            self._populate_tree()
+            return
+        out = self.last_out or self.out_var.get().strip() or ""
+        self.tree.delete(*self.tree.get_children())
+        self._tree_paths = {}
+        shown = 0
+        for path in getattr(self, "_all_files", []):
+            if needle in os.path.basename(path).lower():
+                n = self.tree.insert("", "end", text=os.path.relpath(path, out)
+                                     if out else path)
+                self._tree_paths[n] = path
+                shown += 1
+        self.tree_count.configure(text="%d match%s" % (shown, "" if shown == 1 else "es"))
+
+    def _save_log(self):
+        path = filedialog.asksaveasfilename(
+            title="Save log", defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*")])
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                f.write(self.log.get("1.0", "end"))
+            self._set_status("Log saved: %s" % path)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _about(self):
+        messagebox.showinfo(
+            "About",
+            "NVMe Source Recovery\n\n"
+            "Read-only forensic recovery of deleted source code, archives,\n"
+            "photos and videos from NTFS / NVMe.\n\n"
+            "Cross-platform (Linux / macOS / Windows), stdlib-only.\n"
+            "The engine issues read commands only — it never writes to the source.")
 
     # -- queue pump -------------------------------------------------------- #
     def _pump(self):
@@ -577,6 +1002,8 @@ class App(object):
 
     def _handle(self, kind, text):
         if kind == "phase":
+            self._phase_idx += 1
+            self._cur_phase = text
             self._append("phase", "\n▸ %s\n" % text)
             self._set_status("Running: %s" % text)
         elif kind == "cmd":
@@ -598,12 +1025,25 @@ class App(object):
             self._append("warn", "  %s\n" % text)
         elif kind == "err":
             self._append("err", "  %s\n" % text)
+        elif kind == "trim_result":
+            action, rc, out, state = text
+            self.nb.select(0)
+            self._append("phase", "\n▸ TRIM %s\n" % action)
+            self._append("ok" if rc == 0 else "err", out.strip() + "\n")
+            self._update_trim_label(state)
+            if rc == 0:
+                self._set_status("TRIM %s done — state: %s" % (action, state))
+            elif action != "status":
+                self._set_status("TRIM %s failed — see log." % action)
+                messagebox.showerror(
+                    "TRIM", "Could not change TRIM. You likely need to run the GUI "
+                    "as %s.\n\nSee the log for details." %
+                    ("Administrator" if IS_WINDOWS else "root (sudo)"))
         elif kind == "finished":
             self._on_finished(text == "ok")
 
     def _maybe_progress(self, text):
         # analyze prints "[analyze]   xx.x%  ..."
-        import re
         m = re.search(r"(\d{1,3}\.\d)%", text)
         if m:
             try:
@@ -621,10 +1061,33 @@ class App(object):
         self.pbar["value"] = 100 if ok else self.pbar["value"]
         self.run_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        el = int(time.time() - self._start_ts) if self._start_ts else 0
+        self._start_ts = None
+        self._cur_phase = ""
+        self.timing.configure(text="⏱ %02d:%02d total" % (el // 60, el % 60))
+        # Imaging finished: point the source at the new image and stop here.
+        dest = self._after_image_dest
+        self._after_image_dest = None
+        if dest is not None:
+            if ok and os.path.isfile(dest):
+                self.src_var.set(dest)
+                self._save_state()
+                self._set_status("Image created — Source is now the .img. Pick phases and Run.")
+                self._append("ok", "\n✔ Image saved: %s\n" % dest)
+                messagebox.showinfo(
+                    "Image ready",
+                    "Saved a read-only image:\n%s\n\n"
+                    "The Source field now points at this image. Pick your phases "
+                    "and click RUN RECOVERY." % dest)
+            else:
+                self._set_status("Imaging failed — see log.")
+            return
+
         self._set_status("Finished." if ok else "Finished with errors — see log.")
         self._append("ok" if ok else "err",
-                     "\n%s\n" % ("✔ All phases complete." if ok
-                                 else "✘ Completed with errors."))
+                     "\n%s  (%dm %02ds)\n" % ("✔ All phases complete." if ok
+                                              else "✘ Completed with errors.",
+                                              el // 60, el % 60))
         self._load_results()
         if ok:
             self.nb.select(1)
@@ -678,9 +1141,17 @@ class App(object):
         self.card_labels["archives"].configure(text=str(arch))
 
         # tree
+        self._populate_tree()
+
+    def _populate_tree(self):
+        out = self.last_out or self.out_var.get().strip()
         self.tree.delete(*self.tree.get_children())
         self._tree_paths = {}
-        self._add_tree_dir("", out, depth=0)
+        self._all_files = []
+        if out and os.path.isdir(out):
+            self._add_tree_dir("", out, depth=0)
+        n = len(self._all_files)
+        self.tree_count.configure(text="%d file%s" % (n, "" if n == 1 else "s"))
 
     def _add_tree_dir(self, parent, path, depth):
         if depth > 6:
@@ -698,6 +1169,8 @@ class App(object):
             self._tree_paths[node] = full
             if isdir:
                 self._add_tree_dir(node, full, depth + 1)
+            elif os.path.isfile(full):
+                self._all_files.append(full)
 
     def _on_tree_select(self, _evt):
         sel = self.tree.selection()
@@ -723,12 +1196,7 @@ class App(object):
             return
         path = self._tree_paths.get(sel[0])
         if path and os.path.isfile(path):
-            for opener in ("xdg-open", "open"):
-                try:
-                    subprocess.Popen([opener, path])
-                    return
-                except Exception:
-                    continue
+            open_path(path)
 
     def _set_preview(self, text):
         self.preview.configure(state="normal")
@@ -756,10 +1224,19 @@ class App(object):
             if not messagebox.askyesno("Quit", "A recovery is running. Stop and quit?"):
                 return
             self.runner.cancel()
+        self._save_state()
         self.root.destroy()
 
 
 def main():
+    # When frozen, the single executable doubles as the engine and trim tool so
+    # the GUI can re-invoke itself (no separate .py files ship with the binary).
+    if len(sys.argv) >= 2 and sys.argv[1] == "--engine":
+        import nvme_recover
+        sys.exit(nvme_recover.main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--trim":
+        import trim_control
+        sys.exit(trim_control.main(sys.argv[2:]))
     root = tk.Tk()
     App(root)
     root.mainloop()

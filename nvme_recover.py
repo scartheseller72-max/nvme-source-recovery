@@ -139,17 +139,41 @@ def filetime_to_iso(ft):
 
 
 # --------------------------------------------------------------------------- #
-#  Unified read-only reader: mmap for files, pread for block devices          #
+#  Unified read-only reader: mmap for image files; aligned seek/read for       #
+#  block / physical devices. Works on Linux, macOS, and Windows.               #
 # --------------------------------------------------------------------------- #
+
+IS_WINDOWS = (os.name == "nt")
+
 
 class Reader(object):
     def __init__(self, path):
         self.path = path
-        self.fd = os.open(path, os.O_RDONLY)
-        st = os.fstat(self.fd)
-        self.is_block = stat.S_ISBLK(st.st_mode)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_BINARY"):                     # Windows: avoid CRLF mangling
+            flags |= os.O_BINARY
+        self.fd = os.open(path, flags)
         self.mm = None
-        if stat.S_ISREG(st.st_mode):
+        self.align = 1                                  # sector alignment for raw reads
+        self._has_pread = hasattr(os, "pread")
+        self.is_block = False
+
+        win_raw = IS_WINDOWS and (path.startswith("\\\\.\\") or
+                                  path.startswith("\\\\?\\"))
+        try:
+            st = os.fstat(self.fd)
+        except OSError:
+            st = None
+
+        if win_raw:
+            # Windows physical drive (\\.\PhysicalDriveN): needs sector-aligned
+            # reads and an ioctl to learn its size.
+            self.is_block = True
+            self.align = 512
+            self.size = self._win_device_size()
+            if not self.size:
+                self.size = self._probe_size()
+        elif st is not None and stat.S_ISREG(st.st_mode):
             self.size = st.st_size
             if self.size > 0:
                 try:
@@ -157,9 +181,49 @@ class Reader(object):
                 except (ValueError, OSError):
                     self.mm = None
         else:
-            # block / char device -- size via lseek to end
-            self.size = os.lseek(self.fd, 0, os.SEEK_END)
-            os.lseek(self.fd, 0, os.SEEK_SET)
+            # Linux/macOS block or char device: size via lseek to end.
+            self.is_block = bool(st and stat.S_ISBLK(st.st_mode))
+            try:
+                self.size = os.lseek(self.fd, 0, os.SEEK_END)
+                os.lseek(self.fd, 0, os.SEEK_SET)
+            except OSError:
+                self.size = self._probe_size()
+
+    def _win_device_size(self):
+        """IOCTL_DISK_GET_LENGTH_INFO via ctypes (Windows only)."""
+        try:
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+            handle = msvcrt.get_osfhandle(self.fd)
+            IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+            outbuf = ctypes.create_string_buffer(8)
+            returned = wintypes.DWORD(0)
+            ok = ctypes.windll.kernel32.DeviceIoControl(
+                wintypes.HANDLE(handle), IOCTL_DISK_GET_LENGTH_INFO,
+                None, 0, outbuf, 8, ctypes.byref(returned), None)
+            if ok:
+                return int.from_bytes(outbuf.raw[:8], "little")
+        except Exception:
+            pass
+        return 0
+
+    def _probe_size(self):
+        """Binary-search the last readable sector if size is otherwise unknown."""
+        a = self.align or 512
+        lo, hi = 0, 1 << 50
+        try:
+            while lo < hi:
+                mid = ((lo + hi + 1) // 2) // a * a
+                if mid <= lo:
+                    break
+                if self._plain_read(mid - a, a):
+                    lo = mid
+                else:
+                    hi = mid - a
+        except Exception:
+            pass
+        return lo
 
     def read(self, off, length):
         if off < 0 or off >= self.size or length <= 0:
@@ -167,12 +231,21 @@ class Reader(object):
         length = min(length, self.size - off)
         if self.mm is not None:
             return self.mm[off:off + length]
+        if self.align > 1:
+            return self._aligned_read(off, length)
+        return self._plain_read(off, length)
+
+    def _plain_read(self, off, length):
         out = bytearray()
         pos = off
         remaining = length
         while remaining > 0:
             try:
-                chunk = os.pread(self.fd, min(remaining, 16 * MiB), pos)
+                if self._has_pread:
+                    chunk = os.pread(self.fd, min(remaining, 16 * MiB), pos)
+                else:
+                    os.lseek(self.fd, pos, os.SEEK_SET)
+                    chunk = os.read(self.fd, min(remaining, 16 * MiB))
             except OSError:
                 break
             if not chunk:
@@ -181,6 +254,18 @@ class Reader(object):
             pos += len(chunk)
             remaining -= len(chunk)
         return bytes(out)
+
+    def _aligned_read(self, off, length):
+        """Expand the request to sector bounds (required for Windows raw devices),
+        read, then slice back to exactly what was asked for."""
+        a = self.align
+        a_start = off - (off % a)
+        a_end = ((off + length + a - 1) // a) * a
+        if a_end > self.size:
+            a_end = self.size
+        raw = self._plain_read(a_start, a_end - a_start)
+        lo = off - a_start
+        return raw[lo:lo + length]
 
     def find(self, needle, start=0, end=None):
         if end is None:
@@ -1475,6 +1560,60 @@ def carve_source(reader, outdir, regions=None, min_len=160,
 
 
 # --------------------------------------------------------------------------- #
+#  Disk imaging: read-only copy of a device/partition to a raw .img file        #
+# --------------------------------------------------------------------------- #
+
+def do_image(reader, dest, chunk=32 * MiB):
+    """Stream a read-only copy of the source to a raw .img file, with progress
+    and a sha256 sidecar. Unreadable regions are filled with zeros (ddrescue-
+    style) so the image stays the correct size and offsets line up."""
+    import hashlib
+    parent = os.path.dirname(os.path.abspath(dest))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    total = reader.size
+    if not total:
+        log("[image] source size is unknown/zero; aborting.")
+        return {"ok": False}
+    if os.path.abspath(dest) == os.path.abspath(reader.path):
+        log("[image] destination equals source; aborting to protect the source.")
+        return {"ok": False}
+
+    h = hashlib.sha256()
+    written = bad = 0
+    next_report = 0
+    log("[image] imaging %s -> %s  (%s)" % (reader.path, dest, human(total)))
+    with open(dest, "wb") as f:
+        pos = 0
+        while pos < total:
+            n = min(chunk, total - pos)
+            data = reader.read(pos, n)
+            if not data:                                # unreadable region
+                data = b"\x00" * n
+                bad += n
+            f.write(data)
+            h.update(data)
+            pos += len(data)
+            written += len(data)
+            if pos >= next_report:
+                log("[image]   %5.1f%%  (%s / %s)" %
+                    (100.0 * pos / total, human(pos), human(total)))
+                next_report = pos + max(chunk, total // 100)
+    digest = h.hexdigest()
+    try:
+        with open(dest + ".sha256", "w") as f:
+            f.write("%s  %s\n" % (digest, os.path.basename(dest)))
+    except Exception:
+        pass
+    log("[image] DONE: wrote %s%s" %
+        (human(written), "" if not bad else "  (%s unreadable -> zero-filled)" % human(bad)))
+    log("[image] sha256: %s" % digest)
+    log("[image] now run recovery against the image: %s" % dest)
+    return {"ok": True, "bytes": written, "unreadable": bad,
+            "sha256": digest, "dest": dest}
+
+
+# --------------------------------------------------------------------------- #
 #  Self-test: builds a synthetic image and proves every carver works           #
 # --------------------------------------------------------------------------- #
 
@@ -1764,6 +1903,10 @@ def main(argv=None):
     sp = sub.add_parser("selftest")
     sp.add_argument("--out", default="/tmp/nvme_selftest")
 
+    sp = sub.add_parser("image")
+    sp.add_argument("--image", required=True, help="source device/image to copy (read-only)")
+    sp.add_argument("--dest", required=True, help="destination .img file to create")
+
     args = p.parse_args(argv)
     if not args.cmd:
         p.print_help()
@@ -1772,12 +1915,41 @@ def main(argv=None):
     if args.cmd == "selftest":
         return selftest(args.out)
 
-    os.makedirs(args.out, exist_ok=True)
-    reader = Reader(args.image)
+    if getattr(args, "out", None):
+        os.makedirs(args.out, exist_ok=True)
+    try:
+        reader = Reader(args.image)
+    except PermissionError:
+        log("[!] PERMISSION DENIED opening %s" % args.image)
+        if IS_WINDOWS:
+            log("[!] Reading a physical drive (\\\\.\\PhysicalDriveN) needs Administrator rights.")
+            log("[!] Right-click run_gui.bat (or your terminal) -> 'Run as administrator', then retry.")
+        else:
+            log("[!] Try again with sudo, or image the device first and recover from the image.")
+        return 1
+    except OSError as exc:
+        log("[!] Could not open %s: %s" % (args.image, exc))
+        return 1
+
     if reader.is_block:
-        log("[!] SOURCE IS A LIVE BLOCK DEVICE. Strongly recommend imaging first.")
-        log("[!] Opening READ-ONLY. Do NOT mount this device read-write.\n")
+        log("[!] SOURCE IS A LIVE BLOCK/PHYSICAL DEVICE. Strongly recommend imaging first.")
+        log("[!] Opening READ-ONLY. Do NOT mount this device read-write.")
+        if IS_WINDOWS:
+            log("[!] Windows: run this from an Administrator prompt to read \\\\.\\PhysicalDriveN.")
+        log("")
+    if not reader.size:
+        log("[!] Could not determine source size (0 bytes). On Windows raw devices")
+        log("[!] this usually means it needs Administrator privileges. Aborting.")
+        reader.close()
+        return 1
     log("[+] source=%s size=%s\n" % (args.image, human(reader.size)))
+
+    if args.cmd == "image":
+        try:
+            res = do_image(reader, args.dest)
+        finally:
+            reader.close()
+        return 0 if res.get("ok") else 1
 
     geom = None
     if getattr(args, "cluster_size", None) or getattr(args, "mft_offset", None):

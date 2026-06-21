@@ -150,11 +150,43 @@ Two convenience commands tie these together:
 
 Prefer clicking to typing? A stdlib-only (`tkinter`) front-end drives the exact
 same read-only engine, with live log streaming, a progress bar, a device picker,
-and a results browser that lets you read recovered files in-app.
+and a results browser that lets you read recovered files in-app. It runs on
+**Linux, macOS, and Windows**.
 
 ```bash
+# Linux / macOS
 ./03_recover_gui.sh            # or:  python3 nvme_recover_gui.py
 ```
+
+```bat
+REM Windows  (double-click run_gui.bat, or:)
+python nvme_recover_gui.py
+```
+
+The GUI remembers your last source/output/phase selection, supports keyboard
+shortcuts (Ctrl+R run, Esc stop, F5 refresh, Ctrl+S save log), shows a live
+elapsed-time / phase counter, and has a filter box for the results tree.
+
+**Disable TRIM before you start.** TRIM is what physically erases deleted data
+on an SSD, so the toolkit can query and toggle it system-wide from **Tools ▸
+TRIM** (or the *TRIM PROTECTION* panel): the GUI shows the current state and lets
+you **Disable** it (to protect what's left) before recovery and **Enable** it
+again afterwards. This changes an OS setting — never any drive's contents — is
+system-wide, needs Administrator/root, and only stops *future* erasure (anything
+already TRIMed is gone). From the command line:
+
+```bash
+python3 trim_control.py status      # show current TRIM state
+sudo python3 trim_control.py disable   # protect deleted data (run as admin on Windows)
+sudo python3 trim_control.py enable    # restore after recovery
+```
+
+**Image the drive first, from the GUI.** Click **① Image drive → .img**
+(or Run ▸ Image drive…) to make a read-only raw copy of the selected disk /
+partition to a `.img` file, with live progress and a `.sha256` sidecar. When it
+finishes, the Source field automatically switches to the new image so you then
+recover from the safe copy — never the original drive. On Windows, reading a
+physical drive needs the GUI started **as Administrator**.
 
 | | |
 | --- | --- |
@@ -170,14 +202,45 @@ command for your distro (`sudo apt install -y python3-tk` on Debian/Ubuntu).
 
 ---
 
+## Standalone builds (no Python install needed)
+
+Every push is built into a single self-contained executable for **Windows,
+Linux, and macOS** by GitHub Actions (`.github/workflows/build.yml`) — grab one
+from the run's **Artifacts**, or from the **Releases** page for tagged versions.
+The one binary doubles as the GUI, the recovery engine, and the TRIM tool (it
+re-invokes itself with `--engine` / `--trim`), so there's nothing else to copy.
+
+Build it yourself for your current OS (PyInstaller does not cross-compile):
+
+```bash
+python3 -m pip install pyinstaller
+python3 build.py            # -> dist/nvme-recovery  (or .exe / .app)
+```
+
+To cut a versioned release with binaries attached, push a tag:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+---
+
 ## Requirements
 
-Run from a **Linux live USB** (SystemRescue / Ubuntu / Mint). Do not boot the
-affected Windows installation.
+For the **safest** recovery, run from a **Linux live USB** (SystemRescue /
+Ubuntu / Mint) and do not boot the affected Windows installation — that keeps the
+damaged drive from being written to.
 
 ```bash
 sudo apt update && sudo apt install -y gddrescue nvme-cli gdisk python3 p7zip-full
 ```
+
+The recovery **engine and GUI are cross-platform** (Linux / macOS / Windows),
+stdlib-only Python 3.6+. On Windows you can run them directly against a forensic
+`.img` (no extra rights) or against a physical drive `\\.\PhysicalDriveN` (start
+the GUI / Command Prompt **as Administrator**, read-only). The imaging script
+`01_image_drive.sh` is Linux-only; on Windows, image with a tool like
+FTK Imager or `dd for Windows`, then point this toolkit at the resulting image.
 
 | Package | Purpose |
 | --- | --- |
@@ -285,6 +348,7 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
   media                                photo + video carving (true boundaries)
   source    [--include-unclassified]   language-aware source carving
   all       [--carve-nonresident]      full pipeline + summary
+  image     --dest FILE                read-only copy of a device to a .img (+ sha256)
   selftest                             self-validate the engine
 
   common:   --regions <regions.json>   restrict scan to live extents (faster)
@@ -325,11 +389,16 @@ nvme-source-recovery/
 +-- README.md
 +-- BACKSTORY.md           how the incident happened and why this toolkit exists
 +-- LICENSE
-+-- nvme_recover.py        recovery engine (MFT + USN + archives + source)
++-- nvme_recover.py        recovery engine (MFT + USN + archives + media + source)
 +-- nvme_recover_gui.py    desktop GUI front-end (tkinter, stdlib-only)
-+-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture
-+-- 02_run_recovery.sh     one-command pipeline runner
-+-- 03_recover_gui.sh      launches the GUI
++-- trim_control.py        query / disable / enable SSD TRIM (Win/Linux/macOS)
++-- build.py               build a standalone executable (PyInstaller)
++-- .github/workflows/     CI: cross-platform binary builds + releases
++-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture (Linux)
++-- 02_run_recovery.sh     one-command pipeline runner (Linux/macOS)
++-- 03_recover_gui.sh      launches the GUI (Linux/macOS)
++-- run_recovery.bat       one-command pipeline runner (Windows)
++-- run_gui.bat            launches the GUI (Windows)
 +-- assets/                logo, mark, and vector icons used by this README
 ```
 
