@@ -46,6 +46,7 @@ except Exception as exc:                                    # pragma: no cover
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.join(HERE, "nvme_recover.py")
+TRIM_SCRIPT = os.path.join(HERE, "trim_control.py")
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".nvme_recover_gui.json")
@@ -307,6 +308,7 @@ class App(object):
         self._bind_keys()
         self._tick()
         self.root.after(80, self._pump)
+        self.root.after(300, lambda: self._trim("status"))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_icon(self):
@@ -341,6 +343,13 @@ class App(object):
         runm.add_command(label="Refresh results", command=self._load_results,
                          accelerator="F5")
         bar.add_cascade(label="Run", menu=runm)
+        toolsm = tk.Menu(bar, tearoff=0)
+        toolsm.add_command(label="TRIM status", command=lambda: self._trim("status"))
+        toolsm.add_command(label="Disable TRIM (protect data)",
+                           command=lambda: self._trim("disable"))
+        toolsm.add_command(label="Enable TRIM (restore)",
+                           command=lambda: self._trim("enable"))
+        bar.add_cascade(label="Tools", menu=toolsm)
         helpm = tk.Menu(bar, tearoff=0)
         helpm.add_command(label="About", command=self._about)
         bar.add_cascade(label="Help", menu=helpm)
@@ -524,6 +533,25 @@ class App(object):
         self.opt_unclass = tk.BooleanVar(value=False)
         ttk.Checkbutton(inner, text="Keep unclassified text blobs",
                         variable=self.opt_unclass).pack(anchor="w", pady=(5, 0))
+
+        # --- TRIM protection ---
+        ttk.Label(inner, text="TRIM PROTECTION", style="H2.TLabel").pack(anchor="w", pady=(12, 0))
+        self.trim_status = ttk.Label(inner, text="TRIM: checking…",
+                                     style="PanelMute.TLabel")
+        self.trim_status.pack(anchor="w", pady=(2, 4))
+        trow = ttk.Frame(inner, style="Panel.TFrame")
+        trow.pack(fill="x")
+        ttk.Button(trow, text="Check",
+                   command=lambda: self._trim("status")).pack(side="left")
+        ttk.Button(trow, text="Disable (protect)",
+                   command=lambda: self._trim("disable")).pack(side="left", padx=(6, 0))
+        ttk.Button(trow, text="Enable (restore)",
+                   command=lambda: self._trim("enable")).pack(side="left", padx=(6, 0))
+        ttk.Label(inner, text="System-wide; affects all SSDs and needs admin/root. "
+                  "Disable BEFORE connecting the damaged drive. Only stops FUTURE "
+                  "erasure — already-TRIMed data is gone.",
+                  style="PanelMute.TLabel", wraplength=296,
+                  justify="left").pack(anchor="w", pady=(2, 0))
 
         # --- Sticky action footer (always visible, never scrolls) ---
         footer = ttk.Frame(left, style="Footer.TFrame", padding=(12, 10))
@@ -788,6 +816,54 @@ class App(object):
         self.last_out = os.path.dirname(dest) or None
         self._start_jobs([("Image drive", argv)])
 
+    # -- TRIM control ------------------------------------------------------ #
+    def _trim(self, action):
+        if not os.path.isfile(TRIM_SCRIPT):
+            messagebox.showerror("Missing", "trim_control.py not found next to the GUI.")
+            return
+        if action == "disable":
+            if not messagebox.askyesno(
+                    "Disable TRIM?",
+                    "Turn TRIM OFF system-wide to protect deleted data from further "
+                    "erasure?\n\n• Affects ALL SSDs on this machine.\n"
+                    "• Changes an OS setting, not any drive's contents.\n"
+                    "• Only prevents FUTURE erasure — already-TRIMed data is gone.\n"
+                    "• Needs %s.\n\nProceed?" % ("Administrator" if IS_WINDOWS else "root/sudo")):
+                return
+        elif action == "enable":
+            if not messagebox.askyesno(
+                    "Enable TRIM?",
+                    "Turn TRIM back ON system-wide?\n\nDo this only AFTER you have "
+                    "finished recovering — it lets the SSD erase freed blocks again "
+                    "(good for performance/longevity).\n\nProceed?"):
+                return
+        self._set_status("TRIM: running %s…" % action)
+        threading.Thread(target=self._trim_worker, args=(action,), daemon=True).start()
+
+    def _trim_worker(self, action):
+        try:
+            r = subprocess.run([sys.executable, TRIM_SCRIPT, action],
+                               capture_output=True, text=True, timeout=90)
+            out = (r.stdout or "") + (r.stderr or "")
+            rc = r.returncode
+        except Exception as exc:
+            out, rc = str(exc), 1
+        state = "UNKNOWN"
+        for line in out.splitlines():
+            if line.startswith("TRIM_STATE:"):
+                state = line.split(":", 1)[1].strip()
+        self.q.put(("trim_result", (action, rc, out, state)))
+
+    def _update_trim_label(self, state):
+        text = {
+            "DISABLED": "TRIM: OFF — safe for recovery",
+            "ENABLED": "TRIM: ON — disable before recovery",
+            "MIXED": "TRIM: MIXED — some volumes still trimming",
+            "UNKNOWN": "TRIM: unknown (need admin/root to read?)",
+        }.get(state, "TRIM: " + state)
+        color = {"DISABLED": OK, "ENABLED": WARN, "MIXED": WARN}.get(state, FG_MUTE)
+        self.trim_status.configure(text=text, foreground=color)
+
     def _start_jobs(self, jobs):
         if self.runner.is_running():
             messagebox.showinfo("Busy", "A recovery is already running.")
@@ -928,6 +1004,20 @@ class App(object):
             self._append("warn", "  %s\n" % text)
         elif kind == "err":
             self._append("err", "  %s\n" % text)
+        elif kind == "trim_result":
+            action, rc, out, state = text
+            self.nb.select(0)
+            self._append("phase", "\n▸ TRIM %s\n" % action)
+            self._append("ok" if rc == 0 else "err", out.strip() + "\n")
+            self._update_trim_label(state)
+            if rc == 0:
+                self._set_status("TRIM %s done — state: %s" % (action, state))
+            elif action != "status":
+                self._set_status("TRIM %s failed — see log." % action)
+                messagebox.showerror(
+                    "TRIM", "Could not change TRIM. You likely need to run the GUI "
+                    "as %s.\n\nSee the log for details." %
+                    ("Administrator" if IS_WINDOWS else "root (sudo)"))
         elif kind == "finished":
             self._on_finished(text == "ok")
 

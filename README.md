@@ -167,6 +167,20 @@ The GUI remembers your last source/output/phase selection, supports keyboard
 shortcuts (Ctrl+R run, Esc stop, F5 refresh, Ctrl+S save log), shows a live
 elapsed-time / phase counter, and has a filter box for the results tree.
 
+**Disable TRIM before you start.** TRIM is what physically erases deleted data
+on an SSD, so the toolkit can query and toggle it system-wide from **Tools ▸
+TRIM** (or the *TRIM PROTECTION* panel): the GUI shows the current state and lets
+you **Disable** it (to protect what's left) before recovery and **Enable** it
+again afterwards. This changes an OS setting — never any drive's contents — is
+system-wide, needs Administrator/root, and only stops *future* erasure (anything
+already TRIMed is gone). From the command line:
+
+```bash
+python3 trim_control.py status      # show current TRIM state
+sudo python3 trim_control.py disable   # protect deleted data (run as admin on Windows)
+sudo python3 trim_control.py enable    # restore after recovery
+```
+
 **Image the drive first, from the GUI.** Click **① Image drive → .img**
 (or Run ▸ Image drive…) to make a read-only raw copy of the selected disk /
 partition to a `.img` file, with live progress and a `.sha256` sidecar. When it
@@ -352,8 +366,9 @@ nvme-source-recovery/
 +-- README.md
 +-- BACKSTORY.md           how the incident happened and why this toolkit exists
 +-- LICENSE
-+-- nvme_recover.py        recovery engine (MFT + USN + archives + source)
++-- nvme_recover.py        recovery engine (MFT + USN + archives + media + source)
 +-- nvme_recover_gui.py    desktop GUI front-end (tkinter, stdlib-only)
++-- trim_control.py        query / disable / enable SSD TRIM (Win/Linux/macOS)
 +-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture (Linux)
 +-- 02_run_recovery.sh     one-command pipeline runner (Linux/macOS)
 +-- 03_recover_gui.sh      launches the GUI (Linux/macOS)
