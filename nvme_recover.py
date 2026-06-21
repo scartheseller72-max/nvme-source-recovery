@@ -1015,6 +1015,323 @@ def carve_gzip(reader, outdir, regions=None, max_member=512 * MiB):
 
 
 # --------------------------------------------------------------------------- #
+#  Phase 4b: Media carving (photos + videos)                                   #
+# --------------------------------------------------------------------------- #
+#
+#  Signature-based carving that finds the REAL end of each file instead of
+#  blindly dumping a fixed window:
+#    * footer-terminated  : JPEG (FFD9), PNG (IEND), GIF (0x3B block-walk)
+#    * size-in-header     : BMP, RIFF (AVI/WEBP), ASF/WMV
+#    * container box-walk : ISO-BMFF (MP4/MOV/M4V/3GP/HEIC/AVIF)
+#    * EBML element-walk  : Matroska / WebM
+#
+#  As with all carving on a TRIM-completed SSD the data clusters may read back
+#  as zeros; this pays off on partially-TRIMed drives, other filesystems, and
+#  for files whose bodies happened to survive.
+
+PHOTO_MAX = 256 * MiB
+VIDEO_MAX = 8 * GiB
+
+ASF_GUID = bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c")
+_BOX_CHAR = re.compile(rb"[A-Za-z0-9 _]{4}")
+
+
+def _be(b, o, n):
+    return int.from_bytes(b[o:o + n], "big")
+
+
+def _find_footer(reader, start, footer, search_from, max_size, tail):
+    """Scan forward from start+search_from for `footer`; return total length
+    (footer end - start + tail) or None. `tail` extra bytes belong to the file
+    after the footer match (e.g. PNG IEND CRC)."""
+    end = min(reader.size, start + max_size)
+    pos = start + search_from
+    chunk = 8 * MiB
+    fl = len(footer)
+    while pos < end:
+        buf = reader.read(pos, min(chunk, end - pos) + fl)
+        i = buf.find(footer)
+        if i != -1:
+            return (pos + i + fl + tail) - start
+        pos += chunk
+    return None
+
+
+def _h_jpeg(reader, off):
+    total = _find_footer(reader, off, b"\xff\xd9", 2, PHOTO_MAX, 0)
+    if total and total > 4:
+        return off, total, "photos", "jpg", "footer"
+    return None
+
+
+def _h_png(reader, off):
+    total = _find_footer(reader, off, b"IEND", 8, PHOTO_MAX, 4)
+    if total and total > 16:
+        return off, total, "photos", "png", "footer"
+    return None
+
+
+def _skip_gif_subblocks(reader, pos, end):
+    while pos < end:
+        b = reader.read(pos, 1)
+        if not b:
+            return end
+        ln = b[0]
+        pos += 1 + ln
+        if ln == 0:
+            break
+    return pos
+
+
+def _h_gif(reader, off):
+    head = reader.read(off, 13)
+    if head[:6] not in (b"GIF87a", b"GIF89a") or len(head) < 13:
+        return None
+    flags = head[10]
+    pos = off + 13
+    if flags & 0x80:
+        pos += 3 * (2 ** ((flags & 7) + 1))
+    end = min(reader.size, off + PHOTO_MAX)
+    while pos < end:
+        b = reader.read(pos, 1)
+        if not b:
+            return None
+        tag = b[0]
+        if tag == 0x3B:                                   # trailer
+            return off, (pos + 1) - off, "photos", "gif", "parsed"
+        elif tag == 0x21:                                 # extension
+            pos = _skip_gif_subblocks(reader, pos + 2, end)
+        elif tag == 0x2C:                                 # image descriptor
+            desc = reader.read(pos, 10)
+            if len(desc) < 10:
+                return None
+            lflags = desc[9]
+            pos += 10
+            if lflags & 0x80:
+                pos += 3 * (2 ** ((lflags & 7) + 1))
+            pos += 1                                       # LZW min code size
+            pos = _skip_gif_subblocks(reader, pos, end)
+        else:
+            return None
+    return None
+
+
+def _h_bmp(reader, off):
+    hdr = reader.read(off, 14)
+    if len(hdr) < 14 or hdr[:2] != b"BM":
+        return None
+    size = le(hdr[2:6])
+    data_off = le(hdr[10:14])
+    if size < 54 or size > PHOTO_MAX or not (26 <= data_off < size):
+        return None
+    return off, size, "photos", "bmp", "header"
+
+
+def _riff_kind(fourcc):
+    if fourcc == b"AVI ":
+        return "videos", "avi"
+    if fourcc == b"WEBP":
+        return "photos", "webp"
+    return None, None
+
+
+def _h_riff(reader, off):
+    hdr = reader.read(off, 12)
+    if len(hdr) < 12 or hdr[:4] != b"RIFF":
+        return None
+    total = 8 + le(hdr[4:8])
+    kind, ext = _riff_kind(hdr[8:12])
+    if not kind or total <= 12 or total > VIDEO_MAX:
+        return None
+    return off, total, kind, ext, "header"
+
+
+_BMFF_PHOTO = (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx",
+               b"mif1", b"msf1", b"avif", b"avis")
+_BMFF_VIDEO = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42",
+               b"mp4v", b"mmp4", b"M4V ", b"M4VH", b"M4VP", b"qt  ", b"3gp",
+               b"3g2", b"dash", b"avc1", b"f4v ")
+
+
+def _bmff_kind(brand):
+    if brand in _BMFF_PHOTO:
+        return "photos", "heic" if brand[:3] != b"avi" else "avif"
+    if brand in _BMFF_VIDEO or brand[:3] in (b"3gp", b"3g2"):
+        ext = "mov" if brand == b"qt  " else ("m4v" if brand[:2] == b"M4" else "mp4")
+        return "videos", ext
+    return None, None
+
+
+def _h_isobmff(reader, off):
+    box_start = off - 4
+    if box_start < 0:
+        return None
+    first_size = _be(reader.read(box_start, 4), 0, 4)
+    if first_size != 1 and not (8 <= first_size <= VIDEO_MAX):
+        return None
+    pos = box_start
+    end = min(reader.size, box_start + VIDEO_MAX)
+    seen_ftyp = False
+    brand = b""
+    while pos + 8 <= end:
+        hdr = reader.read(pos, 16)
+        if len(hdr) < 8:
+            break
+        size = _be(hdr, 0, 4)
+        btype = hdr[4:8]
+        if not _BOX_CHAR.fullmatch(btype):
+            break
+        if size == 1:
+            if len(hdr) < 16:
+                break
+            size = _be(hdr, 8, 8)
+        elif size == 0:
+            break
+        if size < 8:
+            break
+        if btype == b"ftyp":
+            seen_ftyp = True
+            brand = reader.read(pos + 8, 4)
+        pos += size
+    if not seen_ftyp:
+        return None
+    total = pos - box_start
+    kind, ext = _bmff_kind(brand)
+    if not kind or total < 16 or total > VIDEO_MAX:
+        return None
+    return box_start, total, kind, ext, "boxwalk"
+
+
+def _h_asf(reader, off):
+    hdr = reader.read(off, 24)
+    if len(hdr) < 24 or hdr[:16] != ASF_GUID:
+        return None
+    size = le(hdr[16:24])
+    if size < 30 or size > VIDEO_MAX:
+        return None
+    return off, size, "videos", "wmv", "header"
+
+
+def _read_vint(reader, pos, keep_marker):
+    """Read one EBML variable-size integer. Returns (value, length, unknown)."""
+    b = reader.read(pos, 1)
+    if not b or b[0] == 0:
+        return None, 0, False
+    first = b[0]
+    mask = 0x80
+    length = 1
+    while length <= 8 and not (first & mask):
+        mask >>= 1
+        length += 1
+    if length > 8:
+        return None, 0, False
+    raw = reader.read(pos, length)
+    if len(raw) < length:
+        return None, 0, False
+    if keep_marker:
+        return int.from_bytes(raw, "big"), length, False
+    val = first & (mask - 1)
+    for k in range(1, length):
+        val = (val << 8) | raw[k]
+    if val == (1 << (7 * length)) - 1:                    # all data bits set
+        return None, length, True
+    return val, length, False
+
+
+def _h_ebml(reader, off):
+    pos = off
+    end = min(reader.size, off + VIDEO_MAX)
+    count = 0
+    while pos < end and count < 4:
+        idv, idlen, _ = _read_vint(reader, pos, True)
+        if idv is None:
+            break
+        sz, szlen, unknown = _read_vint(reader, pos + idlen, False)
+        if unknown or sz is None:
+            return None
+        pos += idlen + szlen + sz
+        count += 1
+        if idv == 0x18538067:                             # Segment -> last top box
+            break
+    total = pos - off
+    if total < 32 or total > VIDEO_MAX:
+        return None
+    sniff = reader.read(off, min(4096, total))
+    ext = "webm" if b"webm" in sniff else "mkv"
+    return off, total, "videos", ext, "ebml"
+
+
+# (signature, handler).  Order matters only for log readability.
+MEDIA_SIGS = [
+    (b"\xff\xd8\xff", _h_jpeg),
+    (b"\x89PNG\r\n\x1a\n", _h_png),
+    (b"GIF8", _h_gif),
+    (b"BM", _h_bmp),
+    (b"RIFF", _h_riff),
+    (b"ftyp", _h_isobmff),
+    (ASF_GUID, _h_asf),
+    (b"\x1aE\xdf\xa3", _h_ebml),
+]
+
+
+def carve_media(reader, outdir, regions=None):
+    """Carve photos and videos by signature, finding true file boundaries."""
+    import csv
+    m_dir = os.path.join(outdir, "40_media")
+    photo_dir = os.path.join(m_dir, "photos")
+    video_dir = os.path.join(m_dir, "videos")
+    os.makedirs(photo_dir, exist_ok=True)
+    os.makedirs(video_dir, exist_ok=True)
+    extents = regions if regions else [(0, reader.size)]
+    man = os.path.join(m_dir, "media_manifest.csv")
+
+    carved = []                                            # (start, end) dedup
+    counts = {"photos": 0, "videos": 0}
+    by_ext = {}
+    log("[media] scanning for photos & videos ...")
+    with open(man, "w", newline="") as mf:
+        w = csv.writer(mf)
+        w.writerow(["offset_hex", "kind", "ext", "size_bytes", "size_human",
+                    "method", "path"])
+        for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
+            hits = []
+            for sig, handler in MEDIA_SIGS:
+                start = 0
+                while True:
+                    idx = data.find(sig, start)
+                    if idx == -1:
+                        break
+                    start = idx + 1
+                    hits.append((base + idx, handler))
+            hits.sort(key=lambda h: h[0])
+            for abs_off, handler in hits:
+                res = handler(reader, abs_off)
+                if not res:
+                    continue
+                fstart, total, kind, ext, method = res
+                if _overlaps(carved, fstart, fstart + total):
+                    continue
+                blob = reader.read(fstart, total)
+                if not blob or blob.count(0) >= len(blob) - 16:
+                    continue                               # all zeros => TRIMed
+                carved.append((fstart, fstart + total))
+                dest = photo_dir if kind == "photos" else video_dir
+                path = safe_write(dest, "media_%012x.%s" % (fstart, ext), blob)
+                counts[kind] += 1
+                by_ext[ext] = by_ext.get(ext, 0) + 1
+                w.writerow(["0x%x" % fstart, kind, ext, total, human(total),
+                            method, path])
+                if (counts["photos"] + counts["videos"]) % 50 == 0:
+                    log("[media]   %d photos, %d videos so far" %
+                        (counts["photos"], counts["videos"]))
+    log("[media] DONE: %d photos, %d videos  %s" %
+        (counts["photos"], counts["videos"], dict(by_ext)))
+    log("[media] manifest: %s" % man)
+    return {"photos": counts["photos"], "videos": counts["videos"],
+            "by_ext": by_ext, "manifest": man}
+
+
+# --------------------------------------------------------------------------- #
 #  Phase 5: Language-aware source-code carving                                 #
 # --------------------------------------------------------------------------- #
 
@@ -1301,6 +1618,21 @@ def selftest(outdir):
     r = usn_rec("answer.rs", 0x200 | 0x80000000)      # FILE_DELETE|CLOSE
     img[uoff:uoff + len(r)] = r
 
+    # 6) Media: a real 1x1 PNG, a JPEG (FFD8..FFD9), and a minimal MP4 (ISO-BMFF)
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c6360000002000005000100200d0a2db40000000049454e"
+        "44ae426082")
+    png_off = 3 * MiB
+    img[png_off:png_off + len(png)] = png
+    jpg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x55" * 64 + b"\xff\xd9"
+    jpg_off = 3 * MiB + 64 * KiB
+    img[jpg_off:jpg_off + len(jpg)] = jpg
+    mp4 = (b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41"
+           b"\x00\x00\x00\x10mdatHELLO_VID")
+    mp4_off = 5 * MiB
+    img[mp4_off:mp4_off + len(mp4)] = mp4
+
     with open(img_path, "wb") as f:
         f.write(img)
     log("[selftest] wrote synthetic image: %s (%s)" % (img_path, human(SIZE)))
@@ -1313,6 +1645,7 @@ def selftest(outdir):
     mres = mine_mft(reader, out, carve_nonresident=False, regions=None)
     ures = mine_usn(reader, out, regions=ex)
     zres = carve_zip(reader, out, regions=ex)
+    mres_media = carve_media(reader, out, regions=ex)
     sres = carve_source(reader, out, regions=ex)
     reader.close()
 
@@ -1345,6 +1678,17 @@ def selftest(outdir):
         log("[selftest] FAIL: python source not carved (%s)" % langs)
     else:
         log("[selftest] PASS: source carving classified languages: %s" % langs)
+    exts = mres_media["by_ext"]
+    if mres_media["photos"] < 2 or not {"png", "jpg"} <= set(exts):
+        ok = False
+        log("[selftest] FAIL: photos not carved (%s)" % exts)
+    else:
+        log("[selftest] PASS: photos carved (png + jpg, true boundaries)")
+    if mres_media["videos"] < 1 or "mp4" not in exts:
+        ok = False
+        log("[selftest] FAIL: video (mp4) not carved (%s)" % exts)
+    else:
+        log("[selftest] PASS: video carved (mp4 box-walk)")
 
     log("\n[selftest] %s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
@@ -1373,6 +1717,8 @@ def write_summary(outdir, results):
         "  20_archives/zip/       -> rebuilt .zip archives (members extracted)",
         "  20_archives/zip_members-> individual files salvaged from broken zips",
         "  20_archives/7z/        -> carved .7z archives (extract with: 7z x)",
+        "  40_media/photos/       -> carved photos (jpg/png/gif/bmp/webp/heic)",
+        "  40_media/videos/       -> carved videos (mp4/mov/avi/mkv/webm/wmv)",
         "  30_source/<lang>/      -> source fragments grouped by language",
         "",
         "TIP: grep the whole output tree for a unique string you remember:",
@@ -1409,6 +1755,7 @@ def main(argv=None):
 
     sp = sub.add_parser("usn"); add_common(sp)
     sp = sub.add_parser("archives"); add_common(sp)
+    sp = sub.add_parser("media"); add_common(sp)
     sp = sub.add_parser("source"); add_common(sp)
     sp.add_argument("--include-unclassified", action="store_true")
     sp = sub.add_parser("all"); add_common(sp)
@@ -1457,6 +1804,9 @@ def main(argv=None):
             carve_zip(reader, args.out, regions=ex)
             carve_7z(reader, args.out, regions=ex)
             carve_gzip(reader, args.out, regions=ex)
+        elif args.cmd == "media":
+            ex = load_extents(reader, args.regions) if args.regions else None
+            carve_media(reader, args.out, regions=ex)
         elif args.cmd == "source":
             ex = load_extents(reader, args.regions) if args.regions else None
             carve_source(reader, args.out, regions=ex,
@@ -1472,6 +1822,7 @@ def main(argv=None):
             results["zip"] = carve_zip(reader, args.out, regions=ex)
             results["7z"] = carve_7z(reader, args.out, regions=ex)
             results["gzip"] = carve_gzip(reader, args.out, regions=ex)
+            results["media"] = carve_media(reader, args.out, regions=ex)
             results["source"] = carve_source(reader, args.out, regions=ex)
             write_summary(args.out, results)
     finally:

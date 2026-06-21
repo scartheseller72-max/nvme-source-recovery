@@ -13,7 +13,8 @@
 #     2) mft       — recover deleted files from $MFT (resident = INTACT)
 #     3) usn       — timestamped delete log by filename ($UsnJrnl)
 #     4) archives  — ZIP / 7z / gzip carving with validation
-#     5) source    — language-aware .rs/.kt/.py/.sol carving
+#     5) media     — photos & videos carved with true file boundaries
+#     6) source    — language-aware .rs/.kt/.py/.sol carving
 #
 #  Everything is READ-ONLY against the input.
 ###############################################################################
@@ -56,7 +57,10 @@ python3 "$ENGINE" usn --image "$IMG" --out "$OUT" --regions "$REGIONS"
 # 4) Archives (ZIP / 7z / gzip), scanning only live extents for speed
 python3 "$ENGINE" archives --image "$IMG" --out "$OUT" --regions "$REGIONS"
 
-# 5) Source-code carving
+# 5) Media — photos & videos carved with true file boundaries
+python3 "$ENGINE" media --image "$IMG" --out "$OUT" --regions "$REGIONS"
+
+# 6) Source-code carving
 python3 "$ENGINE" source --image "$IMG" --out "$OUT" --regions "$REGIONS"
 
 echo
@@ -66,6 +70,7 @@ echo "   $OUT/10_mft/files/           recovered deleted files (original names)"
 echo "   $OUT/10_mft/mft_manifest.csv  full list of every deleted file found"
 echo "   $OUT/10_mft/usn_journal.csv   timestamped delete log"
 echo "   $OUT/20_archives/             rebuilt zip/7z + salvaged members"
+echo "   $OUT/40_media/photos|videos/  carved photos & videos"
 echo "   $OUT/30_source/<lang>/        carved source by language"
 echo
 echo " Find a specific file fast (use a string you KNOW was in your code):"

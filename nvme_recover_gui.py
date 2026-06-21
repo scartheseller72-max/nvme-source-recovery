@@ -56,6 +56,8 @@ PHASES = [
      "Parse $UsnJrnl into a timestamped delete log by filename."),
     ("archives", "Archives", "archives",
      "Carve & rebuild ZIP / 7z / gzip with CRC validation."),
+    ("media",    "Media",    "media",
+     "Carve photos (jpg/png/gif/bmp/webp/heic) & videos (mp4/mov/avi/mkv/webm/wmv)."),
     ("source",   "Source",   "source",
      "Language-aware carving of raw .rs/.kt/.py/.sol/... text."),
 ]
@@ -393,6 +395,8 @@ class App(object):
         for key, title in [("resident", "Resident files\n(intact)"),
                            ("listed", "Files listed\nin $MFT"),
                            ("deletes", "USN delete\nevents"),
+                           ("photos", "Photos\ncarved"),
+                           ("videos", "Videos\ncarved"),
                            ("source", "Source\nfragments"),
                            ("archives", "Archives\ncarved")]:
             card = ttk.Frame(self.cards, style="Panel.TFrame", padding=10)
@@ -517,7 +521,7 @@ class App(object):
             if cmd == "source" and self.opt_unclass.get():
                 argv.append("--include-unclassified")
             # use regions.json to speed later phases if analyze will have produced it
-            if cmd in ("usn", "archives", "source") and \
+            if cmd in ("usn", "archives", "media", "source") and \
                     ("analyze" in cmds or os.path.isfile(regions)):
                 argv += ["--regions", regions]
             jobs.append((CMD_LABEL.get(cmd, cmd), argv))
@@ -658,9 +662,18 @@ class App(object):
             d = os.path.join(out, "20_archives", sub)
             if os.path.isdir(d):
                 arch += sum(len(fs) for _r, _d, fs in os.walk(d))
+        photos = videos = 0
+        pdir = os.path.join(out, "40_media", "photos")
+        vdir = os.path.join(out, "40_media", "videos")
+        if os.path.isdir(pdir):
+            photos = sum(len(fs) for _r, _d, fs in os.walk(pdir))
+        if os.path.isdir(vdir):
+            videos = sum(len(fs) for _r, _d, fs in os.walk(vdir))
         self.card_labels["resident"].configure(text=str(resident))
         self.card_labels["listed"].configure(text=str(listed))
         self.card_labels["deletes"].configure(text=str(deletes))
+        self.card_labels["photos"].configure(text=str(photos))
+        self.card_labels["videos"].configure(text=str(videos))
         self.card_labels["source"].configure(text=str(src_count))
         self.card_labels["archives"].configure(text=str(arch))
 

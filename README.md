@@ -78,9 +78,9 @@ the realistic win this toolkit is engineered around.
         +---------------------------------------------------------------+
         |  STEP 2   02_run_recovery.sh   ->   nvme_recover.py           |
         |                                                               |
-        |  analyze  ->  mft  ->  usn  ->  archives  ->  source          |
-        |  (where's    (intact  (delete   (zip/7z/     (.rs/.kt/        |
-        |   the data?)  files)   log)      gzip)        .py/.sol)       |
+        |  analyze -> mft -> usn -> archives -> media -> source         |
+        |  (where's   (intact (delete  (zip/7z/    (photos (.rs/.kt/    |
+        |   data?)     files)  log)     gzip)       videos) .py/.sol)   |
         +-------------------------------+-------------------------------+
                                         v
                           recovered/  (your files + manifests)
@@ -123,6 +123,14 @@ the realistic win this toolkit is engineered around.
       <strong>gzip</strong> stream recovery.</td>
     </tr>
     <tr>
+      <td align="center"><img src="assets/icon-archives.png" width="44" alt="media"></td>
+      <td><code>media</code></td>
+      <td><strong>Photos</strong> (jpg/png/gif/bmp/webp/heic) and <strong>videos</strong>
+      (mp4/mov/avi/mkv/webm/wmv) carved with their <em>true</em> file boundaries
+      — footer-terminated, header-sized, or container box-walked — not blind
+      fixed-size dumps.</td>
+    </tr>
+    <tr>
       <td align="center"><img src="assets/icon-source.png" width="44" alt="source"></td>
       <td><code>source</code></td>
       <td>Language-aware carving of raw bytes into buckets:
@@ -151,7 +159,7 @@ and a results browser that lets you read recovered files in-app.
 | | |
 | --- | --- |
 | **Source** | Pick a forensic `.img` or choose a detected `/dev/nvmeXn1` (opened READ-ONLY). |
-| **Phases** | Tick the vectors you want (analyze / mft / usn / archives / source) and hit **Run**. |
+| **Phases** | Tick the vectors you want (analyze / mft / usn / archives / media / source) and hit **Run**. |
 | **Live log** | The engine's output streams in real time, colour-coded, with progress during `analyze`. |
 | **Results** | Summary cards (resident files, USN deletes, source fragments, archives) plus a file tree with an inline preview pane. |
 | **Self-test** | One button proves the whole engine works on a synthetic image — no drive required. |
@@ -240,6 +248,10 @@ recovered/
 |   +-- zip_members/          <- individual files salvaged from broken zips
 |   +-- 7z/                   <- carved .7z (extract with: 7z x)
 |   +-- gzip/                 <- decompressed gzip streams
++-- 40_media/
+|   +-- photos/               <- carved jpg/png/gif/bmp/webp/heic
+|   +-- videos/               <- carved mp4/mov/avi/mkv/webm/wmv
+|   +-- media_manifest.csv    <- offset, kind, ext, size, carve method
 +-- 30_source/
 |   +-- rust/ kotlin/ python/ solidity/ go/ javascript/ ...
 |   +-- source_manifest.csv   <- offset, language, confidence, preview
@@ -270,6 +282,7 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
             [--cluster-size N] [--mft-offset N]
   usn                                  $UsnJrnl delete log
   archives                             ZIP / 7z / gzip carving
+  media                                photo + video carving (true boundaries)
   source    [--include-unclassified]   language-aware source carving
   all       [--carve-nonresident]      full pipeline + summary
   selftest                             self-validate the engine
