@@ -138,6 +138,30 @@ Two convenience commands tie these together:
 
 ---
 
+## Desktop GUI (no command line needed)
+
+Prefer clicking to typing? A stdlib-only (`tkinter`) front-end drives the exact
+same read-only engine, with live log streaming, a progress bar, a device picker,
+and a results browser that lets you read recovered files in-app.
+
+```bash
+./03_recover_gui.sh            # or:  python3 nvme_recover_gui.py
+```
+
+| | |
+| --- | --- |
+| **Source** | Pick a forensic `.img` or choose a detected `/dev/nvmeXn1` (opened READ-ONLY). |
+| **Phases** | Tick the vectors you want (analyze / mft / usn / archives / source) and hit **Run**. |
+| **Live log** | The engine's output streams in real time, colour-coded, with progress during `analyze`. |
+| **Results** | Summary cards (resident files, USN deletes, source fragments, archives) plus a file tree with an inline preview pane. |
+| **Self-test** | One button proves the whole engine works on a synthetic image — no drive required. |
+
+The GUI never touches the source: it only ever launches `nvme_recover.py`, which
+issues read commands only. If `tkinter` is missing it prints the one-line install
+command for your distro (`sudo apt install -y python3-tk` on Debian/Ubuntu).
+
+---
+
 ## Requirements
 
 Run from a **Linux live USB** (SystemRescue / Ubuntu / Mint). Do not boot the
@@ -153,6 +177,7 @@ sudo apt update && sudo apt install -y gddrescue nvme-cli gdisk python3 p7zip-fu
 | `nvme-cli` | SMART / id-ctrl / TRIM-state capture |
 | `gdisk` | GPT partition-table backup (`sgdisk`) |
 | `python3` | the recovery engine (3.6+, **standard library only**) |
+| `python3-tk` | optional — only for the desktop GUI (`nvme_recover_gui.py`) |
 | `p7zip-full` | optional — to *extract* carved `.7z` (carving works without it) |
 
 ---
@@ -288,8 +313,10 @@ nvme-source-recovery/
 +-- BACKSTORY.md           how the incident happened and why this toolkit exists
 +-- LICENSE
 +-- nvme_recover.py        recovery engine (MFT + USN + archives + source)
++-- nvme_recover_gui.py    desktop GUI front-end (tkinter, stdlib-only)
 +-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture
 +-- 02_run_recovery.sh     one-command pipeline runner
++-- 03_recover_gui.sh      launches the GUI
 +-- assets/                logo, mark, and vector icons used by this README
 ```
 
