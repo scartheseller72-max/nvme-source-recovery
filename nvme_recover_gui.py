@@ -386,8 +386,23 @@ class App(object):
         st.map("Accent.TButton",
                background=[("active", "#5aa0ea"), ("disabled", BORDER)],
                foreground=[("disabled", FG_MUTE)])
-        st.configure("TCheckbutton", background=BG_PANEL, foreground=FG)
-        st.map("TCheckbutton", background=[("active", BG_PANEL)])
+        # Checkbuttons: make the tick state unmistakable on a dark theme.
+        # Unchecked = dark box with a visible border; checked = filled accent box.
+        for cb_style in ("TCheckbutton", "Phase.TCheckbutton"):
+            st.configure(cb_style, background=BG_PANEL, foreground=FG,
+                         focuscolor=BG_PANEL, indicatorbackground=BG_INPUT,
+                         indicatorforeground=ACCENT, indicatorcolor=BG_INPUT,
+                         bordercolor=BORDER, indicatormargin=4)
+            st.map(cb_style,
+                   background=[("active", BG_PANEL)],
+                   foreground=[("disabled", FG_MUTE)],
+                   indicatorbackground=[("selected", ACCENT),
+                                        ("active", "#1b2937")],
+                   indicatorforeground=[("selected", "#06121f")],
+                   indicatorcolor=[("selected", ACCENT), ("active", "#1b2937")],
+                   bordercolor=[("selected", ACCENT), ("active", ACCENT)])
+        st.configure("Phase.TCheckbutton", font=self.f_h2)
+        st.configure("Footer.TFrame", background=BG_INPUT)
         st.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG,
                      insertcolor=FG, bordercolor=BORDER)
         st.configure("TCombobox", fieldbackground=BG_INPUT, foreground=FG,
@@ -428,38 +443,55 @@ class App(object):
         self._build_statusbar()
 
     def _build_left(self, parent):
-        left = ttk.Frame(parent, style="Panel.TFrame", padding=14)
+        # Outer panel: row 0 = scrollable config, row 1 = sticky action footer.
+        left = ttk.Frame(parent, style="Panel.TFrame")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
 
-        # Source
-        ttk.Label(left, text="SOURCE  (image or device)", style="H2.TLabel").pack(anchor="w")
-        srow = ttk.Frame(left, style="Panel.TFrame")
+        canvas = tk.Canvas(left, bg=BG_PANEL, highlightthickness=0, borderwidth=0)
+        vsb = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        inner = ttk.Frame(canvas, style="Panel.TFrame", padding=(14, 14, 8, 14))
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        self._bind_wheel(canvas)
+
+        # --- Source ---
+        ttk.Label(inner, text="SOURCE  (image or device)", style="H2.TLabel").pack(anchor="w")
+        srow = ttk.Frame(inner, style="Panel.TFrame")
         srow.pack(fill="x", pady=(4, 2))
         self.src_var = tk.StringVar()
         self.src_combo = ttk.Combobox(srow, textvariable=self.src_var)
         self.src_combo.pack(side="left", fill="x", expand=True)
         ttk.Button(srow, text="↻", width=3, command=self._refresh_devices).pack(side="left", padx=(4, 0))
-        brow = ttk.Frame(left, style="Panel.TFrame")
+        brow = ttk.Frame(inner, style="Panel.TFrame")
         brow.pack(fill="x")
         ttk.Button(brow, text="Browse image…", command=self._pick_image).pack(side="left")
         dev_hint = ("Pick a forensic .img, or a detected disk "
                     "(\\\\.\\PhysicalDriveN — run as Administrator)." if IS_WINDOWS
                     else "Pick a forensic .img, or a detected device (opened read-only).")
-        ttk.Label(left, text=dev_hint, style="PanelMute.TLabel",
-                  wraplength=300, justify="left").pack(anchor="w", pady=(2, 10))
+        ttk.Label(inner, text=dev_hint, style="PanelMute.TLabel",
+                  wraplength=300, justify="left").pack(anchor="w", pady=(2, 12))
 
-        # Output
-        ttk.Label(left, text="OUTPUT DIRECTORY", style="H2.TLabel").pack(anchor="w")
-        orow = ttk.Frame(left, style="Panel.TFrame")
+        # --- Output ---
+        ttk.Label(inner, text="OUTPUT DIRECTORY", style="H2.TLabel").pack(anchor="w")
+        orow = ttk.Frame(inner, style="Panel.TFrame")
         orow.pack(fill="x", pady=(4, 2))
         self.out_var = tk.StringVar()
         ttk.Entry(orow, textvariable=self.out_var).pack(side="left", fill="x", expand=True)
         ttk.Button(orow, text="Browse…", command=self._pick_out).pack(side="left", padx=(4, 0))
-        ttk.Label(left, text="Recovered files & manifests are written here.",
-                  style="PanelMute.TLabel").pack(anchor="w", pady=(2, 10))
+        ttk.Label(inner, text="Recovered files & manifests are written here.",
+                  style="PanelMute.TLabel").pack(anchor="w", pady=(2, 12))
 
-        # Phases
-        phdr = ttk.Frame(left, style="Panel.TFrame")
+        # --- Phases ---
+        phdr = ttk.Frame(inner, style="Panel.TFrame")
         phdr.pack(fill="x")
         ttk.Label(phdr, text="PHASES", style="H2.TLabel").pack(side="left")
         ttk.Button(phdr, text="none", width=5,
@@ -469,36 +501,58 @@ class App(object):
         for pid, label, _cmd, tip in PHASES:
             v = tk.BooleanVar(value=True)
             self.phase_vars[pid] = v
-            cb = ttk.Checkbutton(left, text=label, variable=v)
-            cb.pack(anchor="w", pady=(3, 0))
-            ttk.Label(left, text=tip, style="PanelMute.TLabel",
-                      wraplength=300, justify="left").pack(anchor="w", padx=(22, 0))
+            cb = ttk.Checkbutton(inner, text=label, variable=v, style="Phase.TCheckbutton")
+            cb.pack(anchor="w", pady=(5, 0))
+            ttk.Label(inner, text=tip, style="PanelMute.TLabel",
+                      wraplength=296, justify="left").pack(anchor="w", padx=(24, 0))
 
-        # Options
-        ttk.Label(left, text="OPTIONS", style="H2.TLabel").pack(anchor="w", pady=(10, 0))
+        # --- Options ---
+        ttk.Label(inner, text="OPTIONS", style="H2.TLabel").pack(anchor="w", pady=(12, 0))
         self.opt_carve = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Carve non-resident file bodies",
-                        variable=self.opt_carve).pack(anchor="w", pady=(3, 0))
-        ttk.Label(left, text="Pull data from cluster runs (may be zeros if TRIMed).",
-                  style="PanelMute.TLabel", wraplength=300,
-                  justify="left").pack(anchor="w", padx=(22, 0))
+        ttk.Checkbutton(inner, text="Carve non-resident file bodies",
+                        variable=self.opt_carve).pack(anchor="w", pady=(5, 0))
+        ttk.Label(inner, text="Pull data from cluster runs (may be zeros if TRIMed).",
+                  style="PanelMute.TLabel", wraplength=296,
+                  justify="left").pack(anchor="w", padx=(24, 0))
         self.opt_unclass = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Keep unclassified text blobs",
-                        variable=self.opt_unclass).pack(anchor="w", pady=(3, 0))
+        ttk.Checkbutton(inner, text="Keep unclassified text blobs",
+                        variable=self.opt_unclass).pack(anchor="w", pady=(5, 0))
 
-        # Run buttons
-        btns = ttk.Frame(left, style="Panel.TFrame")
-        btns.pack(fill="x", pady=(14, 0))
-        self.run_btn = ttk.Button(btns, text="▶  Run", style="Accent.TButton",
+        # --- Sticky action footer (always visible, never scrolls) ---
+        footer = ttk.Frame(left, style="Footer.TFrame", padding=(12, 10))
+        footer.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.run_btn = ttk.Button(footer, text="▶  RUN RECOVERY", style="Accent.TButton",
                                   command=self._run_selected)
-        self.run_btn.pack(side="left", fill="x", expand=True)
-        self.stop_btn = ttk.Button(btns, text="■ Stop", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.run_btn.pack(fill="x")
+        row2 = ttk.Frame(footer, style="Footer.TFrame")
+        row2.pack(fill="x", pady=(6, 0))
+        self.stop_btn = ttk.Button(row2, text="■ Stop", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", fill="x", expand=True)
+        ttk.Button(row2, text="Self-test", command=self._run_selftest).pack(side="left", padx=(6, 0), fill="x", expand=True)
+        ttk.Button(row2, text="Open output", command=self._open_output).pack(side="left", padx=(6, 0), fill="x", expand=True)
 
-        extra = ttk.Frame(left, style="Panel.TFrame")
-        extra.pack(fill="x", pady=(6, 0))
-        ttk.Button(extra, text="Self-test", command=self._run_selftest).pack(side="left", fill="x", expand=True)
-        ttk.Button(extra, text="Open output", command=self._open_output).pack(side="left", padx=(6, 0), fill="x", expand=True)
+    def _bind_wheel(self, canvas):
+        def _on_wheel(event):
+            if event.num == 4:                          # Linux scroll up
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:                        # Linux scroll down
+                canvas.yview_scroll(1, "units")
+            else:                                       # Windows / macOS
+                canvas.yview_scroll(int(-event.delta / 120) or
+                                    (-1 if event.delta > 0 else 1), "units")
+
+        def _enter(_e):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _leave(_e):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _enter)
+        canvas.bind("<Leave>", _leave)
 
     def _build_right(self, parent):
         self.nb = ttk.Notebook(parent)
