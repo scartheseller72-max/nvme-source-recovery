@@ -167,6 +167,13 @@ The GUI remembers your last source/output/phase selection, supports keyboard
 shortcuts (Ctrl+R run, Esc stop, F5 refresh, Ctrl+S save log), shows a live
 elapsed-time / phase counter, and has a filter box for the results tree.
 
+**Image the drive first, from the GUI.** Click **① Image drive → .img**
+(or Run ▸ Image drive…) to make a read-only raw copy of the selected disk /
+partition to a `.img` file, with live progress and a `.sha256` sidecar. When it
+finishes, the Source field automatically switches to the new image so you then
+recover from the safe copy — never the original drive. On Windows, reading a
+physical drive needs the GUI started **as Administrator**.
+
 | | |
 | --- | --- |
 | **Source** | Pick a forensic `.img` or choose a detected `/dev/nvmeXn1` (opened READ-ONLY). |
@@ -304,6 +311,7 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
   media                                photo + video carving (true boundaries)
   source    [--include-unclassified]   language-aware source carving
   all       [--carve-nonresident]      full pipeline + summary
+  image     --dest FILE                read-only copy of a device to a .img (+ sha256)
   selftest                             self-validate the engine
 
   common:   --regions <regions.json>   restrict scan to live extents (faster)

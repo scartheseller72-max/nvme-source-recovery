@@ -1560,6 +1560,60 @@ def carve_source(reader, outdir, regions=None, min_len=160,
 
 
 # --------------------------------------------------------------------------- #
+#  Disk imaging: read-only copy of a device/partition to a raw .img file        #
+# --------------------------------------------------------------------------- #
+
+def do_image(reader, dest, chunk=32 * MiB):
+    """Stream a read-only copy of the source to a raw .img file, with progress
+    and a sha256 sidecar. Unreadable regions are filled with zeros (ddrescue-
+    style) so the image stays the correct size and offsets line up."""
+    import hashlib
+    parent = os.path.dirname(os.path.abspath(dest))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    total = reader.size
+    if not total:
+        log("[image] source size is unknown/zero; aborting.")
+        return {"ok": False}
+    if os.path.abspath(dest) == os.path.abspath(reader.path):
+        log("[image] destination equals source; aborting to protect the source.")
+        return {"ok": False}
+
+    h = hashlib.sha256()
+    written = bad = 0
+    next_report = 0
+    log("[image] imaging %s -> %s  (%s)" % (reader.path, dest, human(total)))
+    with open(dest, "wb") as f:
+        pos = 0
+        while pos < total:
+            n = min(chunk, total - pos)
+            data = reader.read(pos, n)
+            if not data:                                # unreadable region
+                data = b"\x00" * n
+                bad += n
+            f.write(data)
+            h.update(data)
+            pos += len(data)
+            written += len(data)
+            if pos >= next_report:
+                log("[image]   %5.1f%%  (%s / %s)" %
+                    (100.0 * pos / total, human(pos), human(total)))
+                next_report = pos + max(chunk, total // 100)
+    digest = h.hexdigest()
+    try:
+        with open(dest + ".sha256", "w") as f:
+            f.write("%s  %s\n" % (digest, os.path.basename(dest)))
+    except Exception:
+        pass
+    log("[image] DONE: wrote %s%s" %
+        (human(written), "" if not bad else "  (%s unreadable -> zero-filled)" % human(bad)))
+    log("[image] sha256: %s" % digest)
+    log("[image] now run recovery against the image: %s" % dest)
+    return {"ok": True, "bytes": written, "unreadable": bad,
+            "sha256": digest, "dest": dest}
+
+
+# --------------------------------------------------------------------------- #
 #  Self-test: builds a synthetic image and proves every carver works           #
 # --------------------------------------------------------------------------- #
 
@@ -1849,6 +1903,10 @@ def main(argv=None):
     sp = sub.add_parser("selftest")
     sp.add_argument("--out", default="/tmp/nvme_selftest")
 
+    sp = sub.add_parser("image")
+    sp.add_argument("--image", required=True, help="source device/image to copy (read-only)")
+    sp.add_argument("--dest", required=True, help="destination .img file to create")
+
     args = p.parse_args(argv)
     if not args.cmd:
         p.print_help()
@@ -1857,8 +1915,22 @@ def main(argv=None):
     if args.cmd == "selftest":
         return selftest(args.out)
 
-    os.makedirs(args.out, exist_ok=True)
-    reader = Reader(args.image)
+    if getattr(args, "out", None):
+        os.makedirs(args.out, exist_ok=True)
+    try:
+        reader = Reader(args.image)
+    except PermissionError:
+        log("[!] PERMISSION DENIED opening %s" % args.image)
+        if IS_WINDOWS:
+            log("[!] Reading a physical drive (\\\\.\\PhysicalDriveN) needs Administrator rights.")
+            log("[!] Right-click run_gui.bat (or your terminal) -> 'Run as administrator', then retry.")
+        else:
+            log("[!] Try again with sudo, or image the device first and recover from the image.")
+        return 1
+    except OSError as exc:
+        log("[!] Could not open %s: %s" % (args.image, exc))
+        return 1
+
     if reader.is_block:
         log("[!] SOURCE IS A LIVE BLOCK/PHYSICAL DEVICE. Strongly recommend imaging first.")
         log("[!] Opening READ-ONLY. Do NOT mount this device read-write.")
@@ -1871,6 +1943,13 @@ def main(argv=None):
         reader.close()
         return 1
     log("[+] source=%s size=%s\n" % (args.image, human(reader.size)))
+
+    if args.cmd == "image":
+        try:
+            res = do_image(reader, args.dest)
+        finally:
+            reader.close()
+        return 0 if res.get("ok") else 1
 
     geom = None
     if getattr(args, "cluster_size", None) or getattr(args, "mft_offset", None):

@@ -286,6 +286,7 @@ class App(object):
         self.phase_vars = {}
         self.last_out = None
         self.settings = load_settings()
+        self._after_image_dest = None
         self._start_ts = None
         self._phase_idx = 0
         self._phase_total = 0
@@ -330,6 +331,8 @@ class App(object):
         filem.add_command(label="Quit", command=self._on_close, accelerator="Ctrl+Q")
         bar.add_cascade(label="File", menu=filem)
         runm = tk.Menu(bar, tearoff=0)
+        runm.add_command(label="Image drive… (create .img)", command=self._image_drive)
+        runm.add_separator()
         runm.add_command(label="Run selected", command=self._run_selected,
                          accelerator="Ctrl+R")
         runm.add_command(label="Stop", command=self._stop, accelerator="Esc")
@@ -474,9 +477,13 @@ class App(object):
         brow = ttk.Frame(inner, style="Panel.TFrame")
         brow.pack(fill="x")
         ttk.Button(brow, text="Browse image…", command=self._pick_image).pack(side="left")
+        ttk.Button(brow, text="① Image drive → .img",
+                   command=self._image_drive).pack(side="left", padx=(6, 0))
         dev_hint = ("Pick a forensic .img, or a detected disk "
-                    "(\\\\.\\PhysicalDriveN — run as Administrator)." if IS_WINDOWS
-                    else "Pick a forensic .img, or a detected device (opened read-only).")
+                    "(\\\\.\\PhysicalDriveN — run as Administrator).\n"
+                    "Tip: image the drive first, then recover from the safe copy." if IS_WINDOWS
+                    else "Pick a forensic .img, or a detected device (opened read-only).\n"
+                    "Tip: image the drive first, then recover from the safe copy.")
         ttk.Label(inner, text=dev_hint, style="PanelMute.TLabel",
                   wraplength=300, justify="left").pack(anchor="w", pady=(2, 12))
 
@@ -748,6 +755,39 @@ class App(object):
         self.last_out = os.path.join(out, "out")
         self._start_jobs([("Self-test", argv)])
 
+    def _image_drive(self):
+        """Create a read-only raw image of the selected disk/partition first."""
+        src = self.src_var.get().strip()
+        if not src or (not self._is_device(src) and not os.path.exists(src)):
+            messagebox.showerror("Source missing",
+                                 "Select the disk / device (or an image) to copy first.")
+            return
+        if not os.path.isfile(ENGINE):
+            messagebox.showerror("Engine missing",
+                                 "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
+            return
+        initial = (self.out_var.get().strip() or os.path.expanduser("~"))
+        dest = filedialog.asksaveasfilename(
+            title="Save disk image as…", defaultextension=".img",
+            initialdir=initial if os.path.isdir(initial) else os.path.expanduser("~"),
+            initialfile="rescue.img",
+            filetypes=[("Raw disk image", "*.img"), ("All files", "*")])
+        if not dest:
+            return
+        if self._is_device(src):
+            note = ("\n\nWindows: the GUI must be running as Administrator to read it."
+                    if IS_WINDOWS else "")
+            if not messagebox.askyesno(
+                    "Create read-only image?",
+                    "Read %s and write a full image to:\n%s\n\n"
+                    "The source is opened READ-ONLY and never modified.%s\n\nProceed?"
+                    % (src, dest, note)):
+                return
+        argv = [sys.executable, ENGINE, "image", "--image", src, "--dest", dest]
+        self._after_image_dest = dest
+        self.last_out = os.path.dirname(dest) or None
+        self._start_jobs([("Image drive", argv)])
+
     def _start_jobs(self, jobs):
         if self.runner.is_running():
             messagebox.showinfo("Busy", "A recovery is already running.")
@@ -914,6 +954,24 @@ class App(object):
         self._start_ts = None
         self._cur_phase = ""
         self.timing.configure(text="⏱ %02d:%02d total" % (el // 60, el % 60))
+        # Imaging finished: point the source at the new image and stop here.
+        dest = self._after_image_dest
+        self._after_image_dest = None
+        if dest is not None:
+            if ok and os.path.isfile(dest):
+                self.src_var.set(dest)
+                self._save_state()
+                self._set_status("Image created — Source is now the .img. Pick phases and Run.")
+                self._append("ok", "\n✔ Image saved: %s\n" % dest)
+                messagebox.showinfo(
+                    "Image ready",
+                    "Saved a read-only image:\n%s\n\n"
+                    "The Source field now points at this image. Pick your phases "
+                    "and click RUN RECOVERY." % dest)
+            else:
+                self._set_status("Imaging failed — see log.")
+            return
+
         self._set_status("Finished." if ok else "Finished with errors — see log.")
         self._append("ok" if ok else "err",
                      "\n%s  (%dm %02ds)\n" % ("✔ All phases complete." if ok
