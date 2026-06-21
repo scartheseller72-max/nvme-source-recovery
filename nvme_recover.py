@@ -139,17 +139,41 @@ def filetime_to_iso(ft):
 
 
 # --------------------------------------------------------------------------- #
-#  Unified read-only reader: mmap for files, pread for block devices          #
+#  Unified read-only reader: mmap for image files; aligned seek/read for       #
+#  block / physical devices. Works on Linux, macOS, and Windows.               #
 # --------------------------------------------------------------------------- #
+
+IS_WINDOWS = (os.name == "nt")
+
 
 class Reader(object):
     def __init__(self, path):
         self.path = path
-        self.fd = os.open(path, os.O_RDONLY)
-        st = os.fstat(self.fd)
-        self.is_block = stat.S_ISBLK(st.st_mode)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_BINARY"):                     # Windows: avoid CRLF mangling
+            flags |= os.O_BINARY
+        self.fd = os.open(path, flags)
         self.mm = None
-        if stat.S_ISREG(st.st_mode):
+        self.align = 1                                  # sector alignment for raw reads
+        self._has_pread = hasattr(os, "pread")
+        self.is_block = False
+
+        win_raw = IS_WINDOWS and (path.startswith("\\\\.\\") or
+                                  path.startswith("\\\\?\\"))
+        try:
+            st = os.fstat(self.fd)
+        except OSError:
+            st = None
+
+        if win_raw:
+            # Windows physical drive (\\.\PhysicalDriveN): needs sector-aligned
+            # reads and an ioctl to learn its size.
+            self.is_block = True
+            self.align = 512
+            self.size = self._win_device_size()
+            if not self.size:
+                self.size = self._probe_size()
+        elif st is not None and stat.S_ISREG(st.st_mode):
             self.size = st.st_size
             if self.size > 0:
                 try:
@@ -157,9 +181,49 @@ class Reader(object):
                 except (ValueError, OSError):
                     self.mm = None
         else:
-            # block / char device -- size via lseek to end
-            self.size = os.lseek(self.fd, 0, os.SEEK_END)
-            os.lseek(self.fd, 0, os.SEEK_SET)
+            # Linux/macOS block or char device: size via lseek to end.
+            self.is_block = bool(st and stat.S_ISBLK(st.st_mode))
+            try:
+                self.size = os.lseek(self.fd, 0, os.SEEK_END)
+                os.lseek(self.fd, 0, os.SEEK_SET)
+            except OSError:
+                self.size = self._probe_size()
+
+    def _win_device_size(self):
+        """IOCTL_DISK_GET_LENGTH_INFO via ctypes (Windows only)."""
+        try:
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+            handle = msvcrt.get_osfhandle(self.fd)
+            IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+            outbuf = ctypes.create_string_buffer(8)
+            returned = wintypes.DWORD(0)
+            ok = ctypes.windll.kernel32.DeviceIoControl(
+                wintypes.HANDLE(handle), IOCTL_DISK_GET_LENGTH_INFO,
+                None, 0, outbuf, 8, ctypes.byref(returned), None)
+            if ok:
+                return int.from_bytes(outbuf.raw[:8], "little")
+        except Exception:
+            pass
+        return 0
+
+    def _probe_size(self):
+        """Binary-search the last readable sector if size is otherwise unknown."""
+        a = self.align or 512
+        lo, hi = 0, 1 << 50
+        try:
+            while lo < hi:
+                mid = ((lo + hi + 1) // 2) // a * a
+                if mid <= lo:
+                    break
+                if self._plain_read(mid - a, a):
+                    lo = mid
+                else:
+                    hi = mid - a
+        except Exception:
+            pass
+        return lo
 
     def read(self, off, length):
         if off < 0 or off >= self.size or length <= 0:
@@ -167,12 +231,21 @@ class Reader(object):
         length = min(length, self.size - off)
         if self.mm is not None:
             return self.mm[off:off + length]
+        if self.align > 1:
+            return self._aligned_read(off, length)
+        return self._plain_read(off, length)
+
+    def _plain_read(self, off, length):
         out = bytearray()
         pos = off
         remaining = length
         while remaining > 0:
             try:
-                chunk = os.pread(self.fd, min(remaining, 16 * MiB), pos)
+                if self._has_pread:
+                    chunk = os.pread(self.fd, min(remaining, 16 * MiB), pos)
+                else:
+                    os.lseek(self.fd, pos, os.SEEK_SET)
+                    chunk = os.read(self.fd, min(remaining, 16 * MiB))
             except OSError:
                 break
             if not chunk:
@@ -181,6 +254,18 @@ class Reader(object):
             pos += len(chunk)
             remaining -= len(chunk)
         return bytes(out)
+
+    def _aligned_read(self, off, length):
+        """Expand the request to sector bounds (required for Windows raw devices),
+        read, then slice back to exactly what was asked for."""
+        a = self.align
+        a_start = off - (off % a)
+        a_end = ((off + length + a - 1) // a) * a
+        if a_end > self.size:
+            a_end = self.size
+        raw = self._plain_read(a_start, a_end - a_start)
+        lo = off - a_start
+        return raw[lo:lo + length]
 
     def find(self, needle, start=0, end=None):
         if end is None:
@@ -1775,8 +1860,16 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
     reader = Reader(args.image)
     if reader.is_block:
-        log("[!] SOURCE IS A LIVE BLOCK DEVICE. Strongly recommend imaging first.")
-        log("[!] Opening READ-ONLY. Do NOT mount this device read-write.\n")
+        log("[!] SOURCE IS A LIVE BLOCK/PHYSICAL DEVICE. Strongly recommend imaging first.")
+        log("[!] Opening READ-ONLY. Do NOT mount this device read-write.")
+        if IS_WINDOWS:
+            log("[!] Windows: run this from an Administrator prompt to read \\\\.\\PhysicalDriveN.")
+        log("")
+    if not reader.size:
+        log("[!] Could not determine source size (0 bytes). On Windows raw devices")
+        log("[!] this usually means it needs Administrator privileges. Aborting.")
+        reader.close()
+        return 1
     log("[+] source=%s size=%s\n" % (args.image, human(reader.size)))
 
     geom = None

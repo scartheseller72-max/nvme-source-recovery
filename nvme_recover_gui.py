@@ -20,13 +20,14 @@ so a long scan never freezes the UI and the engine stays untouched.
 """
 
 import os
+import re
 import sys
 import csv
 import glob
 import json
+import time
 import queue
 import shlex
-import signal
 import threading
 import subprocess
 
@@ -45,6 +46,9 @@ except Exception as exc:                                    # pragma: no cover
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.join(HERE, "nvme_recover.py")
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".nvme_recover_gui.json")
 
 # Phase id -> (label, engine subcommand, tooltip)
 PHASES = [
@@ -93,13 +97,63 @@ def human(n):
     return "%.1f PiB" % n
 
 
-def detect_block_devices():
-    """Return [(path, label)] for likely source devices. Best-effort, read-only."""
+def open_path(path):
+    """Open a file or folder with the OS default handler. Cross-platform."""
+    try:
+        if IS_WINDOWS:
+            os.startfile(path)                          # noqa: type checker
+        elif IS_MAC:
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
+def _detect_windows():
     out = []
     try:
-        res = subprocess.run(
-            ["lsblk", "-dpno", "NAME,SIZE,MODEL,TYPE"],
-            capture_output=True, text=True, timeout=5)
+        ps = ("Get-CimInstance Win32_DiskDrive | ForEach-Object "
+              "{ \"$($_.DeviceID)|$($_.Size)|$($_.Model)\" }")
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=10)
+        for line in res.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) < 2 or not parts[0].strip():
+                continue
+            dev = parts[0].strip()                      # \\.\PHYSICALDRIVE0
+            size = parts[1].strip()
+            model = parts[2].strip() if len(parts) > 2 else ""
+            hs = human(int(size)) if size.isdigit() else size
+            out.append((dev, "%s  (%s%s)" % (dev, hs, "  " + model if model else "")))
+    except Exception:
+        pass
+    return out
+
+
+def _detect_macos():
+    out = []
+    try:
+        res = subprocess.run(["diskutil", "list"], capture_output=True,
+                             text=True, timeout=8)
+        for line in res.stdout.splitlines():
+            m = re.match(r"^(/dev/disk\d+)\b", line)
+            if m:
+                out.append((m.group(1), line.strip()))
+    except Exception:
+        pass
+    if not out:
+        for dev in sorted(glob.glob("/dev/disk[0-9]")):
+            out.append((dev, dev))
+    return out
+
+
+def _detect_linux():
+    out = []
+    try:
+        res = subprocess.run(["lsblk", "-dpno", "NAME,SIZE,MODEL,TYPE"],
+                             capture_output=True, text=True, timeout=5)
         if res.returncode == 0:
             for line in res.stdout.splitlines():
                 parts = line.split(None, 3)
@@ -109,17 +163,41 @@ def detect_block_devices():
                 typ = parts[3] if len(parts) > 3 else ""
                 model = parts[2] if len(parts) > 2 else ""
                 if "disk" in (typ.lower() if typ else "") or "disk" in line.lower():
-                    label = "%s  (%s%s)" % (name, size, "  " + model if model else "")
-                    out.append((name, label))
+                    out.append((name, "%s  (%s%s)" % (name, size,
+                                "  " + model if model else "")))
             if out:
                 return out
     except Exception:
         pass
-    # Fallback: glob common device nodes
     for pat in ("/dev/nvme*n[0-9]", "/dev/sd[a-z]"):
         for dev in sorted(glob.glob(pat)):
             out.append((dev, dev))
     return out
+
+
+def detect_block_devices():
+    """Return [(path, label)] for likely source devices. Best-effort, read-only."""
+    if IS_WINDOWS:
+        return _detect_windows()
+    if IS_MAC:
+        return _detect_macos()
+    return _detect_linux()
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 def count_csv_rows(path):
@@ -157,7 +235,7 @@ class Runner(object):
         p = self.proc
         if p and p.poll() is None:
             try:
-                p.send_signal(signal.SIGTERM)
+                p.terminate()                           # cross-platform
             except Exception:
                 pass
 
@@ -207,18 +285,71 @@ class App(object):
         self.runner = Runner(self.q)
         self.phase_vars = {}
         self.last_out = None
+        self.settings = load_settings()
+        self._start_ts = None
+        self._phase_idx = 0
+        self._phase_total = 0
+        self._cur_phase = ""
 
         root.title("NVMe Source Recovery")
         root.configure(bg=BG)
-        root.geometry("1100x720")
-        root.minsize(900, 600)
+        root.geometry("1180x760")
+        root.minsize(940, 620)
 
         self._init_fonts()
         self._init_style()
+        self._set_icon()
+        self._build_menu()
         self._build()
+        self._apply_settings()
         self._refresh_devices()
+        self._bind_keys()
+        self._tick()
         self.root.after(80, self._pump)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_icon(self):
+        for name in ("mark.png", "logo.png"):
+            p = os.path.join(HERE, "assets", name)
+            if os.path.isfile(p):
+                try:
+                    self._icon = tk.PhotoImage(file=p)
+                    self.root.iconphoto(True, self._icon)
+                    return
+                except Exception:
+                    continue
+
+    def _build_menu(self):
+        bar = tk.Menu(self.root)
+        filem = tk.Menu(bar, tearoff=0)
+        filem.add_command(label="Open output folder", command=self._open_output,
+                          accelerator="Ctrl+O")
+        filem.add_command(label="Save log…", command=self._save_log,
+                          accelerator="Ctrl+S")
+        filem.add_separator()
+        filem.add_command(label="Quit", command=self._on_close, accelerator="Ctrl+Q")
+        bar.add_cascade(label="File", menu=filem)
+        runm = tk.Menu(bar, tearoff=0)
+        runm.add_command(label="Run selected", command=self._run_selected,
+                         accelerator="Ctrl+R")
+        runm.add_command(label="Stop", command=self._stop, accelerator="Esc")
+        runm.add_command(label="Self-test", command=self._run_selftest)
+        runm.add_separator()
+        runm.add_command(label="Refresh results", command=self._load_results,
+                         accelerator="F5")
+        bar.add_cascade(label="Run", menu=runm)
+        helpm = tk.Menu(bar, tearoff=0)
+        helpm.add_command(label="About", command=self._about)
+        bar.add_cascade(label="Help", menu=helpm)
+        self.root.config(menu=bar)
+
+    def _bind_keys(self):
+        self.root.bind("<Control-r>", lambda e: self._run_selected())
+        self.root.bind("<Control-o>", lambda e: self._open_output())
+        self.root.bind("<Control-s>", lambda e: self._save_log())
+        self.root.bind("<Control-q>", lambda e: self._on_close())
+        self.root.bind("<F5>", lambda e: self._load_results())
+        self.root.bind("<Escape>", lambda e: self._stop())
 
     # -- styling ----------------------------------------------------------- #
     def _init_fonts(self):
@@ -311,8 +442,11 @@ class App(object):
         brow = ttk.Frame(left, style="Panel.TFrame")
         brow.pack(fill="x")
         ttk.Button(brow, text="Browse image…", command=self._pick_image).pack(side="left")
-        ttk.Label(left, text="Pick a forensic .img, or a /dev node (opened read-only).",
-                  style="PanelMute.TLabel", wraplength=300, justify="left").pack(anchor="w", pady=(2, 10))
+        dev_hint = ("Pick a forensic .img, or a detected disk "
+                    "(\\\\.\\PhysicalDriveN — run as Administrator)." if IS_WINDOWS
+                    else "Pick a forensic .img, or a detected device (opened read-only).")
+        ttk.Label(left, text=dev_hint, style="PanelMute.TLabel",
+                  wraplength=300, justify="left").pack(anchor="w", pady=(2, 10))
 
         # Output
         ttk.Label(left, text="OUTPUT DIRECTORY", style="H2.TLabel").pack(anchor="w")
@@ -325,7 +459,13 @@ class App(object):
                   style="PanelMute.TLabel").pack(anchor="w", pady=(2, 10))
 
         # Phases
-        ttk.Label(left, text="PHASES", style="H2.TLabel").pack(anchor="w")
+        phdr = ttk.Frame(left, style="Panel.TFrame")
+        phdr.pack(fill="x")
+        ttk.Label(phdr, text="PHASES", style="H2.TLabel").pack(side="left")
+        ttk.Button(phdr, text="none", width=5,
+                   command=lambda: self._set_all_phases(False)).pack(side="right")
+        ttk.Button(phdr, text="all", width=4,
+                   command=lambda: self._set_all_phases(True)).pack(side="right", padx=(0, 4))
         for pid, label, _cmd, tip in PHASES:
             v = tk.BooleanVar(value=True)
             self.phase_vars[pid] = v
@@ -413,8 +553,19 @@ class App(object):
         split.pack(fill="both", expand=True)
 
         treebox = ttk.Frame(split)
-        self.tree = ttk.Treeview(treebox, show="tree", selectmode="browse")
-        tsb = ttk.Scrollbar(treebox, orient="vertical", command=self.tree.yview)
+        frow = ttk.Frame(treebox)
+        frow.pack(fill="x", pady=(0, 4))
+        ttk.Label(frow, text="Filter:", style="Mute.TLabel").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self._apply_filter())
+        ttk.Entry(frow, textvariable=self.filter_var).pack(side="left", fill="x",
+                                                           expand=True, padx=(4, 6))
+        self.tree_count = ttk.Label(frow, text="", style="Mute.TLabel")
+        self.tree_count.pack(side="right")
+        treerow = ttk.Frame(treebox)
+        treerow.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(treerow, show="tree", selectmode="browse")
+        tsb = ttk.Scrollbar(treerow, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
         tsb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
@@ -444,6 +595,8 @@ class App(object):
         bar.pack(fill="x")
         self.pbar = ttk.Progressbar(bar, mode="determinate", maximum=100)
         self.pbar.pack(side="left", fill="x", expand=True)
+        self.timing = ttk.Label(bar, text="", style="Mute.TLabel")
+        self.timing.pack(side="left", padx=(10, 0))
         self.status = ttk.Label(bar, text="Ready.", style="Mute.TLabel")
         self.status.pack(side="left", padx=10)
 
@@ -471,10 +624,14 @@ class App(object):
     def _selected_phase_cmds(self):
         return [cmd for pid, _l, cmd, _t in PHASES if self.phase_vars[pid].get()]
 
+    def _is_device(self, src):
+        return src.startswith(("/dev/", "\\\\.\\", "\\\\?\\"))
+
     def _validate(self):
         src = self.src_var.get().strip()
         out = self.out_var.get().strip()
-        if not src or not os.path.exists(src):
+        is_dev = self._is_device(src)
+        if not src or (not is_dev and not os.path.exists(src)):
             messagebox.showerror("Source missing",
                                  "Select a valid image file or device first.")
             return None
@@ -485,11 +642,14 @@ class App(object):
             messagebox.showerror("Engine missing",
                                  "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
             return None
-        if src.startswith("/dev/"):
+        if is_dev:
+            note = ("\n\nWindows: this GUI must be started as Administrator to read it."
+                    if IS_WINDOWS else "")
             if not messagebox.askyesno(
                     "Run against a live device?",
-                    "%s is a block device.\n\nThe engine opens it READ-ONLY, but the "
-                    "recommended workflow is to image it first.\n\nContinue read-only?" % src):
+                    "%s is a physical device.\n\nThe engine opens it READ-ONLY, but the "
+                    "recommended workflow is to image it first.%s\n\nContinue read-only?"
+                    % (src, note)):
                 return None
         return src, out
 
@@ -538,12 +698,16 @@ class App(object):
         if self.runner.is_running():
             messagebox.showinfo("Busy", "A recovery is already running.")
             return
+        self._save_state()
         self._clear_log()
         self._append("phase", "Starting %d phase(s)…\n" % len(jobs))
         self.run_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.pbar.configure(mode="indeterminate")
         self.pbar.start(12)
+        self._start_ts = time.time()
+        self._phase_idx = 0
+        self._phase_total = len(jobs)
         self.nb.select(0)
         self.runner.start(jobs)
 
@@ -557,13 +721,83 @@ class App(object):
         if not path or not os.path.isdir(path):
             messagebox.showinfo("Nothing yet", "No output directory to open.")
             return
-        for opener in ("xdg-open", "open"):
-            try:
-                subprocess.Popen([opener, path])
-                return
-            except Exception:
-                continue
-        messagebox.showinfo("Output", path)
+        if not open_path(path):
+            messagebox.showinfo("Output", path)
+
+    # -- settings, phases, timing, filter, log save ------------------------ #
+    def _apply_settings(self):
+        s = self.settings
+        if s.get("source"):
+            self.src_var.set(s["source"])
+        if s.get("out"):
+            self.out_var.set(s["out"])
+        for pid, var in self.phase_vars.items():
+            if pid in s.get("phases", {}):
+                var.set(bool(s["phases"][pid]))
+        self.opt_carve.set(bool(s.get("carve", False)))
+        self.opt_unclass.set(bool(s.get("unclassified", False)))
+
+    def _save_state(self):
+        save_settings({
+            "source": self.src_var.get().strip(),
+            "out": self.out_var.get().strip(),
+            "phases": {pid: var.get() for pid, var in self.phase_vars.items()},
+            "carve": self.opt_carve.get(),
+            "unclassified": self.opt_unclass.get(),
+        })
+
+    def _set_all_phases(self, value):
+        for var in self.phase_vars.values():
+            var.set(value)
+
+    def _tick(self):
+        if self._start_ts is not None:
+            el = int(time.time() - self._start_ts)
+            phase = "%d/%d" % (self._phase_idx, self._phase_total) \
+                if self._phase_total else ""
+            self.timing.configure(text="⏱ %02d:%02d   phase %s%s" % (
+                el // 60, el % 60, phase,
+                "  ·  " + self._cur_phase if self._cur_phase else ""))
+        self.root.after(500, self._tick)
+
+    def _apply_filter(self):
+        needle = self.filter_var.get().strip().lower()
+        if not needle:
+            self._populate_tree()
+            return
+        out = self.last_out or self.out_var.get().strip() or ""
+        self.tree.delete(*self.tree.get_children())
+        self._tree_paths = {}
+        shown = 0
+        for path in getattr(self, "_all_files", []):
+            if needle in os.path.basename(path).lower():
+                n = self.tree.insert("", "end", text=os.path.relpath(path, out)
+                                     if out else path)
+                self._tree_paths[n] = path
+                shown += 1
+        self.tree_count.configure(text="%d match%s" % (shown, "" if shown == 1 else "es"))
+
+    def _save_log(self):
+        path = filedialog.asksaveasfilename(
+            title="Save log", defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*")])
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                f.write(self.log.get("1.0", "end"))
+            self._set_status("Log saved: %s" % path)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _about(self):
+        messagebox.showinfo(
+            "About",
+            "NVMe Source Recovery\n\n"
+            "Read-only forensic recovery of deleted source code, archives,\n"
+            "photos and videos from NTFS / NVMe.\n\n"
+            "Cross-platform (Linux / macOS / Windows), stdlib-only.\n"
+            "The engine issues read commands only — it never writes to the source.")
 
     # -- queue pump -------------------------------------------------------- #
     def _pump(self):
@@ -577,6 +811,8 @@ class App(object):
 
     def _handle(self, kind, text):
         if kind == "phase":
+            self._phase_idx += 1
+            self._cur_phase = text
             self._append("phase", "\n▸ %s\n" % text)
             self._set_status("Running: %s" % text)
         elif kind == "cmd":
@@ -603,7 +839,6 @@ class App(object):
 
     def _maybe_progress(self, text):
         # analyze prints "[analyze]   xx.x%  ..."
-        import re
         m = re.search(r"(\d{1,3}\.\d)%", text)
         if m:
             try:
@@ -621,10 +856,15 @@ class App(object):
         self.pbar["value"] = 100 if ok else self.pbar["value"]
         self.run_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        el = int(time.time() - self._start_ts) if self._start_ts else 0
+        self._start_ts = None
+        self._cur_phase = ""
+        self.timing.configure(text="⏱ %02d:%02d total" % (el // 60, el % 60))
         self._set_status("Finished." if ok else "Finished with errors — see log.")
         self._append("ok" if ok else "err",
-                     "\n%s\n" % ("✔ All phases complete." if ok
-                                 else "✘ Completed with errors."))
+                     "\n%s  (%dm %02ds)\n" % ("✔ All phases complete." if ok
+                                              else "✘ Completed with errors.",
+                                              el // 60, el % 60))
         self._load_results()
         if ok:
             self.nb.select(1)
@@ -678,9 +918,17 @@ class App(object):
         self.card_labels["archives"].configure(text=str(arch))
 
         # tree
+        self._populate_tree()
+
+    def _populate_tree(self):
+        out = self.last_out or self.out_var.get().strip()
         self.tree.delete(*self.tree.get_children())
         self._tree_paths = {}
-        self._add_tree_dir("", out, depth=0)
+        self._all_files = []
+        if out and os.path.isdir(out):
+            self._add_tree_dir("", out, depth=0)
+        n = len(self._all_files)
+        self.tree_count.configure(text="%d file%s" % (n, "" if n == 1 else "s"))
 
     def _add_tree_dir(self, parent, path, depth):
         if depth > 6:
@@ -698,6 +946,8 @@ class App(object):
             self._tree_paths[node] = full
             if isdir:
                 self._add_tree_dir(node, full, depth + 1)
+            elif os.path.isfile(full):
+                self._all_files.append(full)
 
     def _on_tree_select(self, _evt):
         sel = self.tree.selection()
@@ -723,12 +973,7 @@ class App(object):
             return
         path = self._tree_paths.get(sel[0])
         if path and os.path.isfile(path):
-            for opener in ("xdg-open", "open"):
-                try:
-                    subprocess.Popen([opener, path])
-                    return
-                except Exception:
-                    continue
+            open_path(path)
 
     def _set_preview(self, text):
         self.preview.configure(state="normal")
@@ -756,6 +1001,7 @@ class App(object):
             if not messagebox.askyesno("Quit", "A recovery is running. Stop and quit?"):
                 return
             self.runner.cancel()
+        self._save_state()
         self.root.destroy()
 
 

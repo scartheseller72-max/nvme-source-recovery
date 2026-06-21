@@ -150,11 +150,22 @@ Two convenience commands tie these together:
 
 Prefer clicking to typing? A stdlib-only (`tkinter`) front-end drives the exact
 same read-only engine, with live log streaming, a progress bar, a device picker,
-and a results browser that lets you read recovered files in-app.
+and a results browser that lets you read recovered files in-app. It runs on
+**Linux, macOS, and Windows**.
 
 ```bash
+# Linux / macOS
 ./03_recover_gui.sh            # or:  python3 nvme_recover_gui.py
 ```
+
+```bat
+REM Windows  (double-click run_gui.bat, or:)
+python nvme_recover_gui.py
+```
+
+The GUI remembers your last source/output/phase selection, supports keyboard
+shortcuts (Ctrl+R run, Esc stop, F5 refresh, Ctrl+S save log), shows a live
+elapsed-time / phase counter, and has a filter box for the results tree.
 
 | | |
 | --- | --- |
@@ -172,12 +183,20 @@ command for your distro (`sudo apt install -y python3-tk` on Debian/Ubuntu).
 
 ## Requirements
 
-Run from a **Linux live USB** (SystemRescue / Ubuntu / Mint). Do not boot the
-affected Windows installation.
+For the **safest** recovery, run from a **Linux live USB** (SystemRescue /
+Ubuntu / Mint) and do not boot the affected Windows installation — that keeps the
+damaged drive from being written to.
 
 ```bash
 sudo apt update && sudo apt install -y gddrescue nvme-cli gdisk python3 p7zip-full
 ```
+
+The recovery **engine and GUI are cross-platform** (Linux / macOS / Windows),
+stdlib-only Python 3.6+. On Windows you can run them directly against a forensic
+`.img` (no extra rights) or against a physical drive `\\.\PhysicalDriveN` (start
+the GUI / Command Prompt **as Administrator**, read-only). The imaging script
+`01_image_drive.sh` is Linux-only; on Windows, image with a tool like
+FTK Imager or `dd for Windows`, then point this toolkit at the resulting image.
 
 | Package | Purpose |
 | --- | --- |
@@ -327,9 +346,11 @@ nvme-source-recovery/
 +-- LICENSE
 +-- nvme_recover.py        recovery engine (MFT + USN + archives + source)
 +-- nvme_recover_gui.py    desktop GUI front-end (tkinter, stdlib-only)
-+-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture
-+-- 02_run_recovery.sh     one-command pipeline runner
-+-- 03_recover_gui.sh      launches the GUI
++-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture (Linux)
++-- 02_run_recovery.sh     one-command pipeline runner (Linux/macOS)
++-- 03_recover_gui.sh      launches the GUI (Linux/macOS)
++-- run_recovery.bat       one-command pipeline runner (Windows)
++-- run_gui.bat            launches the GUI (Windows)
 +-- assets/                logo, mark, and vector icons used by this README
 ```
 
