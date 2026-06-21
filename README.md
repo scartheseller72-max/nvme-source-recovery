@@ -78,9 +78,9 @@ the realistic win this toolkit is engineered around.
         +---------------------------------------------------------------+
         |  STEP 2   02_run_recovery.sh   ->   nvme_recover.py           |
         |                                                               |
-        |  analyze  ->  mft  ->  usn  ->  archives  ->  source          |
-        |  (where's    (intact  (delete   (zip/7z/     (.rs/.kt/        |
-        |   the data?)  files)   log)      gzip)        .py/.sol)       |
+        |  analyze -> mft -> usn -> archives -> media -> source         |
+        |  (where's   (intact (delete  (zip/7z/    (photos (.rs/.kt/    |
+        |   data?)     files)  log)     gzip)       videos) .py/.sol)   |
         +-------------------------------+-------------------------------+
                                         v
                           recovered/  (your files + manifests)
@@ -123,6 +123,14 @@ the realistic win this toolkit is engineered around.
       <strong>gzip</strong> stream recovery.</td>
     </tr>
     <tr>
+      <td align="center"><img src="assets/icon-archives.png" width="44" alt="media"></td>
+      <td><code>media</code></td>
+      <td><strong>Photos</strong> (jpg/png/gif/bmp/webp/heic) and <strong>videos</strong>
+      (mp4/mov/avi/mkv/webm/wmv) carved with their <em>true</em> file boundaries
+      — footer-terminated, header-sized, or container box-walked — not blind
+      fixed-size dumps.</td>
+    </tr>
+    <tr>
       <td align="center"><img src="assets/icon-source.png" width="44" alt="source"></td>
       <td><code>source</code></td>
       <td>Language-aware carving of raw bytes into buckets:
@@ -135,6 +143,30 @@ Two convenience commands tie these together:
 
 - `all` — runs every phase in the optimal order and writes `RECOVERY_SUMMARY.txt`.
 - `selftest` — builds a synthetic image and proves every vector works (no drive needed).
+
+---
+
+## Desktop GUI (no command line needed)
+
+Prefer clicking to typing? A stdlib-only (`tkinter`) front-end drives the exact
+same read-only engine, with live log streaming, a progress bar, a device picker,
+and a results browser that lets you read recovered files in-app.
+
+```bash
+./03_recover_gui.sh            # or:  python3 nvme_recover_gui.py
+```
+
+| | |
+| --- | --- |
+| **Source** | Pick a forensic `.img` or choose a detected `/dev/nvmeXn1` (opened READ-ONLY). |
+| **Phases** | Tick the vectors you want (analyze / mft / usn / archives / media / source) and hit **Run**. |
+| **Live log** | The engine's output streams in real time, colour-coded, with progress during `analyze`. |
+| **Results** | Summary cards (resident files, USN deletes, source fragments, archives) plus a file tree with an inline preview pane. |
+| **Self-test** | One button proves the whole engine works on a synthetic image — no drive required. |
+
+The GUI never touches the source: it only ever launches `nvme_recover.py`, which
+issues read commands only. If `tkinter` is missing it prints the one-line install
+command for your distro (`sudo apt install -y python3-tk` on Debian/Ubuntu).
 
 ---
 
@@ -153,6 +185,7 @@ sudo apt update && sudo apt install -y gddrescue nvme-cli gdisk python3 p7zip-fu
 | `nvme-cli` | SMART / id-ctrl / TRIM-state capture |
 | `gdisk` | GPT partition-table backup (`sgdisk`) |
 | `python3` | the recovery engine (3.6+, **standard library only**) |
+| `python3-tk` | optional — only for the desktop GUI (`nvme_recover_gui.py`) |
 | `p7zip-full` | optional — to *extract* carved `.7z` (carving works without it) |
 
 ---
@@ -215,6 +248,10 @@ recovered/
 |   +-- zip_members/          <- individual files salvaged from broken zips
 |   +-- 7z/                   <- carved .7z (extract with: 7z x)
 |   +-- gzip/                 <- decompressed gzip streams
++-- 40_media/
+|   +-- photos/               <- carved jpg/png/gif/bmp/webp/heic
+|   +-- videos/               <- carved mp4/mov/avi/mkv/webm/wmv
+|   +-- media_manifest.csv    <- offset, kind, ext, size, carve method
 +-- 30_source/
 |   +-- rust/ kotlin/ python/ solidity/ go/ javascript/ ...
 |   +-- source_manifest.csv   <- offset, language, confidence, preview
@@ -245,6 +282,7 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
             [--cluster-size N] [--mft-offset N]
   usn                                  $UsnJrnl delete log
   archives                             ZIP / 7z / gzip carving
+  media                                photo + video carving (true boundaries)
   source    [--include-unclassified]   language-aware source carving
   all       [--carve-nonresident]      full pipeline + summary
   selftest                             self-validate the engine
@@ -288,8 +326,10 @@ nvme-source-recovery/
 +-- BACKSTORY.md           how the incident happened and why this toolkit exists
 +-- LICENSE
 +-- nvme_recover.py        recovery engine (MFT + USN + archives + source)
++-- nvme_recover_gui.py    desktop GUI front-end (tkinter, stdlib-only)
 +-- 01_image_drive.sh      read-only ddrescue imaging + controller-state capture
 +-- 02_run_recovery.sh     one-command pipeline runner
++-- 03_recover_gui.sh      launches the GUI
 +-- assets/                logo, mark, and vector icons used by this README
 ```
 
