@@ -191,7 +191,10 @@ isn't listed, mount it and press **Refresh**, or use **Browse…**. The GUI
 refuses a destination on the same disk you're imaging and warns if it won't
 fit. When it finishes, the Source field automatically switches to the new image
 so you then recover from the safe copy — never the original drive. On Windows,
-reading a physical drive needs the GUI started **as Administrator**.
+reading a physical drive needs the GUI started **as Administrator**. Use
+**Verify image** (next to the imaging button) any time to re-hash an `.img` and
+confirm it matches its `.sha256` — that's how you prove the rescue copy is
+complete and uncorrupted before trusting it.
 
 | | |
 | --- | --- |
@@ -354,10 +357,32 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
   source    [--include-unclassified]   language-aware source carving
   all       [--carve-nonresident]      full pipeline + summary
   image     --dest FILE                read-only copy of a device to a .img (+ sha256)
+            [--sector N] [--retries N] [--resume]
+  verify    [--sha256 HASH]            re-hash an .img and check its .sha256 sidecar
   selftest                             self-validate the engine
 
   common:   --regions <regions.json>   restrict scan to live extents (faster)
 ```
+
+### Imaging is forensically robust
+
+`image` reads the source **read-only** and writes a byte-exact `.img` plus a
+`.sha256` sidecar. Bad sectors are handled **ddrescue-style**: when a bulk read
+fails, that chunk is re-read at sector granularity (`--retries` attempts each),
+so a single failing sector zero-fills only *that* sector — not megabytes around
+it — and every byte offset still lines up. Unreadable regions are logged to a
+`.img.map` sidecar, progress shows live **rate + ETA**, and `--resume` continues
+an interrupted image from where it stopped. Afterwards, `verify` re-hashes the
+image and confirms it matches the sidecar — proof it's complete and uncorrupted
+before you trust it (or reuse the original drive).
+
+### Deeper `$MFT` parsing
+
+`mft` reconstructs full paths and records all four NTFS timestamps (created /
+modified / accessed / MFT-changed) and the entry number per file. It follows
+`$ATTRIBUTE_LIST` into extension records, so large/fragmented files get their
+**complete** data-run list (not just the fragment in the base record), and it
+recovers **alternate data streams (ADS)** alongside the main stream.
 
 ---
 

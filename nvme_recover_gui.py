@@ -511,6 +511,7 @@ class App(object):
         bar.add_cascade(label="File", menu=filem)
         runm = tk.Menu(bar, tearoff=0)
         runm.add_command(label="Image drive… (create .img)", command=self._image_drive)
+        runm.add_command(label="Verify image… (check .sha256)", command=self._verify_image)
         runm.add_separator()
         runm.add_command(label="Run selected", command=self._run_selected,
                          accelerator="Ctrl+R")
@@ -668,6 +669,8 @@ class App(object):
         brow2.pack(fill="x", pady=(4, 0))
         ttk.Button(brow2, text="① Image drive → .img",
                    command=self._image_drive).pack(side="left")
+        ttk.Button(brow2, text="Verify image",
+                   command=self._verify_image).pack(side="left", padx=(6, 0))
         dev_hint = ("Pick a forensic .img, or a detected disk "
                     "(\\\\.\\PhysicalDriveN — run as Administrator).\n"
                     "Tip: image the drive first, then recover from the safe copy." if IS_WINDOWS
@@ -1148,6 +1151,31 @@ class App(object):
         self._after_image_dest = dest
         self.last_out = os.path.dirname(dest) or None
         self._start_jobs([("Image drive", argv)])
+
+    def _verify_image(self):
+        """Re-hash an .img and compare it to its .sha256 sidecar so you can
+        confirm a rescue image is complete and uncorrupted before trusting it."""
+        if not FROZEN and not os.path.isfile(ENGINE):
+            messagebox.showerror("Engine missing",
+                                 "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
+            return
+        src = self._source_path()
+        initial = src if (src and os.path.isfile(src)) else \
+            (self.out_var.get().strip() or os.path.expanduser("~"))
+        img = filedialog.askopenfilename(
+            title="Select image to verify",
+            initialdir=os.path.dirname(initial) if os.path.isfile(initial) else initial,
+            filetypes=[("Disk images", "*.img *.dd *.raw *.bin"), ("All files", "*")])
+        if not img:
+            return
+        if not os.path.isfile(img + ".sha256"):
+            if not messagebox.askyesno(
+                    "No checksum sidecar",
+                    "No %s.sha256 was found, so there's nothing to compare against.\n\n"
+                    "Compute and print the image's hash anyway?" % os.path.basename(img)):
+                return
+        self.last_out = os.path.dirname(img) or None
+        self._start_jobs([("Verify image", engine_argv("verify", "--image", img))])
 
     # -- TRIM control ------------------------------------------------------ #
     def _trim(self, action):

@@ -55,6 +55,7 @@ import re
 import stat
 import struct
 import sys
+import time
 import zlib
 import zipfile
 
@@ -521,6 +522,7 @@ def find_ntfs_partitions(reader):
 # --------------------------------------------------------------------------- #
 
 ATTR_STANDARD_INFO = 0x10
+ATTR_ATTRIBUTE_LIST = 0x20
 ATTR_FILE_NAME = 0x30
 ATTR_DATA = 0x80
 ATTR_END = 0xFFFFFFFF
@@ -587,11 +589,14 @@ def parse_mft_record(rec):
         "in_use": bool(flags & 0x01),
         "is_dir": bool(flags & 0x02),
         "seq": seq,
+        "rec_num": le(rec[0x2C:0x30]),   # self entry number (NTFS 3.0+); 0 if absent
         "names": [],          # list of (namespace, name, parent_entry)
         "real_size": 0,
         "alloc_size": 0,
         "resident_data": None,
         "data_runs": None,
+        "ads": [],            # named alternate data streams: list of dicts
+        "attr_list": [],      # [(atype, start_vcn, ref_entry)] from $ATTRIBUTE_LIST
         "si_times": {},
     }
     off = attr_off
@@ -607,6 +612,11 @@ def parse_mft_record(rec):
             break
         non_res = rec[off + 8]
         name_len = rec[off + 9]
+        name_off = le(rec[off + 0x0A:off + 0x0C])
+        attr_name = ""
+        if name_len and off + name_off + name_len * 2 <= len(rec):
+            attr_name = rec[off + name_off: off + name_off + name_len * 2].decode(
+                "utf-16-le", "replace")
         if non_res == 0:
             content_len = le(rec[off + 0x10:off + 0x14])
             content_off = le(rec[off + 0x14:off + 0x16])
@@ -618,7 +628,24 @@ def parse_mft_record(rec):
             info["si_times"] = {
                 "created": filetime_to_iso(le(content[0x00:0x08])),
                 "modified": filetime_to_iso(le(content[0x08:0x10])),
+                "mft_changed": filetime_to_iso(le(content[0x10:0x18]))
+                if len(content) >= 0x18 else "",
+                "accessed": filetime_to_iso(le(content[0x18:0x20]))
+                if len(content) >= 0x20 else "",
             }
+        elif atype == ATTR_ATTRIBUTE_LIST and non_res == 0:
+            # Maps attributes that live in OTHER (extension) MFT records — how
+            # large/fragmented files spread their $DATA runs across records.
+            j = 0
+            while j + 0x18 <= len(content):
+                etype = le(content[j:j + 4])
+                elen = le(content[j + 4:j + 6])
+                if elen < 0x18 or j + elen > len(content):
+                    break
+                start_vcn = le(content[j + 0x08:j + 0x10])
+                ref_entry = le(content[j + 0x10:j + 0x16])
+                info["attr_list"].append((etype, start_vcn, ref_entry))
+                j += elen
         elif atype == ATTR_FILE_NAME and non_res == 0 and len(content) >= 0x42:
             parent = le(content[0x00:0x06])
             real_size = le(content[0x30:0x38])
@@ -628,20 +655,29 @@ def parse_mft_record(rec):
             info["names"].append((nspace, name, parent))
             if real_size:
                 info["real_size"] = real_size
-        elif atype == ATTR_DATA and name_len == 0:
-            # unnamed main stream only (skip ADS)
+        elif atype == ATTR_DATA:
             if non_res == 0:
-                info["resident_data"] = content
-                if len(content) > info["real_size"]:
-                    info["real_size"] = len(content)
+                resident, runs = content, None
+                real = len(content)
+                alloc = 0
             else:
-                real_size = le(rec[off + 0x30:off + 0x38])
+                real = le(rec[off + 0x30:off + 0x38])
                 alloc = le(rec[off + 0x28:off + 0x30])
                 runs_off = le(rec[off + 0x20:off + 0x22])
                 runs = parse_data_runs(rec[off + runs_off: off + alen])
-                info["data_runs"] = runs
-                info["real_size"] = real_size or info["real_size"]
-                info["alloc_size"] = alloc
+                resident = None
+            if name_len == 0:                       # unnamed main stream
+                if resident is not None:
+                    info["resident_data"] = resident
+                    if real > info["real_size"]:
+                        info["real_size"] = real
+                else:
+                    info["data_runs"] = runs
+                    info["real_size"] = real or info["real_size"]
+                    info["alloc_size"] = alloc
+            else:                                   # named alternate data stream
+                info["ads"].append({"name": attr_name, "resident": resident,
+                                    "runs": runs, "size": real})
         off += alen
     return info
 
@@ -683,8 +719,9 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
 
     # Scan extents (or whole image) for 'FILE' record signatures.
     extents = regions if regions else [(0, reader.size)]
-    records = {}          # entry_no -> parsed info (best-effort; keyed by offset order)
-    by_offset = []        # (offset, info)
+    by_offset = []        # named records -> user-facing files
+    entry_index = {}      # MFT entry number -> info (ALL records, incl. extension)
+    mft_off = geom.get("mft_offset")
     found = 0
     scanned = 0
 
@@ -709,9 +746,23 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                 continue
             fixed = apply_fixup(raw)
             info = parse_mft_record(fixed)
-            if not info or not info["names"]:
+            if not info:
                 continue
             info["offset"] = abs_off
+            # Index by entry number so $ATTRIBUTE_LIST can reach extension
+            # records (which may carry the real $DATA runs). Works when the MFT
+            # is contiguous; fall back to the record's self-reported number.
+            entry = None
+            if mft_off is not None:
+                rel = abs_off - mft_off
+                if rel >= 0 and rel % rec_size == 0:
+                    entry = rel // rec_size
+            if entry is None and info.get("rec_num"):
+                entry = info["rec_num"]
+            if entry is not None:
+                entry_index[entry] = info
+            if not info["names"]:           # extension/nameless record: indexed only
+                continue
             by_offset.append(info)
             found += 1
             if found % 2000 == 0:
@@ -722,19 +773,43 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
         if found >= max_records:
             break
 
-    log("[mft] parsed %d MFT records with names" % found)
+    log("[mft] parsed %d MFT records with names (%d total indexed)" %
+        (found, len(entry_index)))
 
-    # Build an entry->name map for path reconstruction. MFT entry number can be
-    # inferred from offset when MFT is contiguous; otherwise we use the parent
-    # references and a fabricated index keyed by (name,parent).
-    # Best-effort: index by sequence of discovery, resolve parents by FILE_NAME.
-    # We reconstruct paths using parent refs walked against records we did parse.
-    entry_index = {}
-    if geom.get("mft_offset") is not None:
-        for info in by_offset:
-            rel = info["offset"] - geom["mft_offset"]
-            if rel >= 0 and rel % rec_size == 0:
-                entry_index[rel // rec_size] = info
+    def merge_attr_list(info):
+        """Pull $DATA that lives in extension records referenced by this record's
+        $ATTRIBUTE_LIST, so fragmented/large non-resident files get their full
+        run list. Returns True if anything was merged."""
+        own = info.get("rec_num")
+        data_refs = sorted(
+            (vcn, ref) for (atype, vcn, ref) in info.get("attr_list", [])
+            if atype == ATTR_DATA)
+        merged_runs = []
+        merged = False
+        for _vcn, ref in data_refs:
+            if ref == own:
+                continue
+            ext = entry_index.get(ref)
+            if not ext or ext is info:
+                continue
+            if ext.get("resident_data") is not None and info["resident_data"] is None:
+                info["resident_data"] = ext["resident_data"]
+                merged = True
+            if ext.get("data_runs"):
+                merged_runs += ext["data_runs"]
+                merged = True
+        if merged_runs:
+            info["data_runs"] = (info.get("data_runs") or []) + merged_runs
+        return merged
+
+    attrlist_merged = 0
+    for info in by_offset:
+        if info.get("attr_list") and not info["is_dir"]:
+            if (info["resident_data"] is None and not info.get("data_runs")):
+                if merge_attr_list(info):
+                    attrlist_merged += 1
+    if attrlist_merged:
+        log("[mft] resolved %d fragmented file(s) via $ATTRIBUTE_LIST" % attrlist_merged)
 
     def resolve_path(info, depth=0):
         name, parent = pick_name(info["names"])
@@ -747,17 +822,32 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
             return name
         return resolve_path(pinfo, depth + 1).rstrip("/") + "/" + name
 
+    def carve_runs(runs, size):
+        """Assemble bytes from data runs (sparse runs -> zeros)."""
+        buf = bytearray()
+        for (length, lcn) in runs:
+            if lcn is None:                       # sparse
+                buf += bytes(length * bpc)
+                continue
+            abs_off = geom.get("part_offset", 0) + lcn * bpc
+            buf += reader.read(abs_off, length * bpc)
+            if size and len(buf) >= size:
+                break
+        return buf[:size] if size else buf
+
     # Recover files + write manifest
     import csv
     man_path = os.path.join(m_dir, "mft_manifest.csv")
     resident_recovered = 0
     targeted_recovered = 0
     targeted_zero = 0
+    ads_recovered = 0
     listed = 0
     with open(man_path, "w", newline="") as mf:
         w = csv.writer(mf)
-        w.writerow(["path", "size_bytes", "is_dir", "in_use", "storage",
-                    "modified", "recovered", "recovered_path", "note"])
+        w.writerow(["path", "entry", "size_bytes", "is_dir", "in_use", "storage",
+                    "created", "modified", "accessed", "mft_changed",
+                    "ads_streams", "recovered", "recovered_path", "note"])
         for info in by_offset:
             if info["is_dir"]:
                 continue
@@ -766,7 +856,9 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                 continue
             path = resolve_path(info) if entry_index else name
             size = info["real_size"]
-            modified = info.get("si_times", {}).get("modified", "")
+            t = info.get("si_times", {})
+            entry = info.get("rec_num", "")
+            ads_names = "|".join(s.get("name", "") for s in info.get("ads", []))
             listed += 1
             recovered = ""
             rec_path = ""
@@ -780,22 +872,14 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                 recovered = "yes"
                 note = "RESIDENT (intact)"
             elif carve_nonresident and info["data_runs"]:
-                buf = bytearray()
-                for (length, lcn) in info["data_runs"]:
-                    if lcn is None:               # sparse
-                        buf += bytes(length * bpc)
-                        continue
-                    abs_off = geom.get("part_offset", 0) + lcn * bpc
-                    buf += reader.read(abs_off, length * bpc)
-                    if size and len(buf) >= size:
-                        break
-                if size:
-                    buf = buf[:size]
+                buf = carve_runs(info["data_runs"], size)
                 if buf and buf.count(0) < len(buf):   # not all zeros -> something survived
                     rec_path = safe_write(files_dir, path or name, bytes(buf))
                     targeted_recovered += 1
                     recovered = "partial/full"
                     note = "TARGETED carve from data runs"
+                    if info.get("attr_list"):
+                        note += " (+$ATTRIBUTE_LIST)"
                 else:
                     targeted_zero += 1
                     recovered = "no"
@@ -803,13 +887,29 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
             else:
                 note = "non-resident; run with --carve-nonresident to attempt"
 
-            w.writerow([path, size, info["is_dir"], info["in_use"],
+            # Recover alternate data streams (where attackers/tools hide data).
+            for s in info.get("ads", []):
+                sdata = None
+                if s.get("resident") is not None:
+                    sdata = s["resident"]
+                elif carve_nonresident and s.get("runs"):
+                    cb = carve_runs(s["runs"], s.get("size", 0))
+                    if cb and cb.count(0) < len(cb):
+                        sdata = bytes(cb)
+                if sdata:
+                    safe_write(files_dir, (path or name) + "_ADS_" +
+                               (s.get("name") or "stream"), sdata)
+                    ads_recovered += 1
+
+            w.writerow([path, entry, size, info["is_dir"], info["in_use"],
                         "resident" if info["resident_data"] is not None else "non-resident",
-                        modified, recovered, rec_path, note])
+                        t.get("created", ""), t.get("modified", ""),
+                        t.get("accessed", ""), t.get("mft_changed", ""),
+                        ads_names, recovered, rec_path, note])
 
     log("[mft] DONE: %d files listed | %d resident recovered INTACT | "
-        "%d targeted-carved | %d non-resident were zero" %
-        (listed, resident_recovered, targeted_recovered, targeted_zero))
+        "%d targeted-carved | %d non-resident were zero | %d ADS recovered" %
+        (listed, resident_recovered, targeted_recovered, targeted_zero, ads_recovered))
     log("[mft] manifest: %s" % man_path)
     log("[mft] recovered files under: %s" % files_dir)
     return {
@@ -817,6 +917,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
         "resident_recovered": resident_recovered,
         "targeted_recovered": targeted_recovered,
         "targeted_zero": targeted_zero,
+        "ads_recovered": ads_recovered,
         "manifest": man_path,
     }
 
@@ -1563,10 +1664,53 @@ def carve_source(reader, outdir, regions=None, min_len=160,
 #  Disk imaging: read-only copy of a device/partition to a raw .img file        #
 # --------------------------------------------------------------------------- #
 
-def do_image(reader, dest, chunk=32 * MiB):
-    """Stream a read-only copy of the source to a raw .img file, with progress
-    and a sha256 sidecar. Unreadable regions are filled with zeros (ddrescue-
-    style) so the image stays the correct size and offsets line up."""
+def _fmt_eta(seconds):
+    if seconds is None or seconds < 0 or seconds == float("inf"):
+        return "--:--"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return ("%d:%02d:%02d" % (h, m, s)) if h else ("%02d:%02d" % (m, s))
+
+
+def _image_recover_chunk(reader, f, h, base, n, sector, retries):
+    """A bulk read came up short, so the chunk straddles a bad region. Re-read it
+    sector by sector (ddrescue-style) so a single bad sector only zero-fills that
+    one sector instead of the whole chunk. Returns (good_bytes, bad_ranges)."""
+    good = 0
+    bad_ranges = []
+    pos = base
+    end = base + n
+    while pos < end:
+        sn = min(sector, end - pos)
+        data = b""
+        for _ in range(max(1, retries)):
+            data = reader.read(pos, sn)
+            if len(data) == sn:
+                break
+        if len(data) == sn:
+            good += sn
+        else:                                           # unreadable sector
+            data = b"\x00" * sn
+            if bad_ranges and bad_ranges[-1][0] + bad_ranges[-1][1] == pos:
+                bad_ranges[-1] = (bad_ranges[-1][0], bad_ranges[-1][1] + sn)
+            else:
+                bad_ranges.append((pos, sn))
+        f.write(data)
+        h.update(data)
+        pos += sn
+    return good, bad_ranges
+
+
+def do_image(reader, dest, chunk=32 * MiB, sector=None, retries=2, resume=False):
+    """Stream a read-only copy of the source to a raw .img file, with live
+    rate/ETA progress and a sha256 sidecar.
+
+    Bad sectors are handled ddrescue-style: when a bulk read fails, that chunk is
+    re-read at sector granularity so only the truly unreadable sectors get
+    zero-filled (keeping the image the exact source size so every offset lines
+    up). Unreadable regions are recorded in a .map sidecar. With resume=True an
+    interrupted image is continued from where the file left off."""
     import hashlib
     parent = os.path.dirname(os.path.abspath(dest))
     if parent:
@@ -1579,38 +1723,148 @@ def do_image(reader, dest, chunk=32 * MiB):
         log("[image] destination equals source; aborting to protect the source.")
         return {"ok": False}
 
+    sector = sector or max(512, getattr(reader, "align", 512) or 512)
+    chunk = max(sector, (chunk // sector) * sector)
+
     h = hashlib.sha256()
     written = bad = 0
-    next_report = 0
-    log("[image] imaging %s -> %s  (%s)" % (reader.path, dest, human(total)))
-    with open(dest, "wb") as f:
-        pos = 0
+    bad_ranges = []
+
+    start = 0
+    mode = "wb"
+    if resume and os.path.isfile(dest):
+        have = (os.path.getsize(dest) // sector) * sector   # back off to sector
+        if 0 < have < total:
+            start = have
+            mode = "r+b"
+            log("[image] resuming from %s (%.1f%%)" %
+                (human(start), 100.0 * start / total))
+
+    log("[image] imaging %s -> %s  (%s, sector %d)" %
+        (reader.path, dest, human(total), sector))
+    t0 = time.time()
+    last_report = t0
+    with open(dest, mode) as f:
+        if start:                                       # hash the existing prefix
+            f.seek(0)
+            hp = 0
+            while hp < start:
+                blk = f.read(min(chunk, start - hp))
+                if not blk:
+                    break
+                h.update(blk)
+                hp += len(blk)
+            f.seek(start)
+            written = start
+        pos = start
         while pos < total:
             n = min(chunk, total - pos)
             data = reader.read(pos, n)
-            if not data:                                # unreadable region
-                data = b"\x00" * n
-                bad += n
-            f.write(data)
-            h.update(data)
-            pos += len(data)
-            written += len(data)
-            if pos >= next_report:
-                log("[image]   %5.1f%%  (%s / %s)" %
-                    (100.0 * pos / total, human(pos), human(total)))
-                next_report = pos + max(chunk, total // 100)
+            if len(data) == n:
+                f.write(data)
+                h.update(data)
+                written += n
+            else:                                       # short read => bad region
+                good, ranges = _image_recover_chunk(
+                    reader, f, h, pos, n, sector, retries)
+                written += n
+                bad += (n - good)
+                bad_ranges += ranges
+            pos += n
+            now = time.time()
+            if now - last_report >= 1.0 or pos >= total:
+                last_report = now
+                done = pos - start
+                rate = done / max(1e-6, now - t0)
+                eta = (total - pos) / rate if rate > 0 else None
+                log("[image]   %5.1f%%  (%s / %s)  %s/s  ETA %s%s" %
+                    (100.0 * pos / total, human(pos), human(total),
+                     human(rate), _fmt_eta(eta),
+                     "" if not bad else "  bad:%s" % human(bad)))
+
     digest = h.hexdigest()
     try:
         with open(dest + ".sha256", "w") as f:
             f.write("%s  %s\n" % (digest, os.path.basename(dest)))
     except Exception:
         pass
-    log("[image] DONE: wrote %s%s" %
-        (human(written), "" if not bad else "  (%s unreadable -> zero-filled)" % human(bad)))
+    if bad_ranges:
+        try:
+            with open(dest + ".map", "w") as f:
+                f.write("# unreadable regions in %s (offset  length  bytes)\n"
+                        % os.path.basename(dest))
+                f.write("# source=%s  size=%d  zero-filled=%d  regions=%d\n"
+                        % (reader.path, total, bad, len(bad_ranges)))
+                for o, l in bad_ranges:
+                    f.write("0x%012x  0x%010x  %d\n" % (o, l, l))
+        except Exception:
+            pass
+
+    elapsed = time.time() - t0
+    log("[image] DONE: wrote %s in %s (%s/s)%s" %
+        (human(written), _fmt_eta(elapsed),
+         human(written / max(1e-6, elapsed)),
+         "" if not bad else "  (%s in %d region(s) unreadable -> zero-filled)"
+         % (human(bad), len(bad_ranges))))
+    if bad_ranges:
+        log("[image] bad-sector map: %s.map" % dest)
+        log("[image] NOTE: %s could not be read; those areas are zeros in the image."
+            % human(bad))
     log("[image] sha256: %s" % digest)
     log("[image] now run recovery against the image: %s" % dest)
     return {"ok": True, "bytes": written, "unreadable": bad,
-            "sha256": digest, "dest": dest}
+            "bad_regions": len(bad_ranges), "sha256": digest, "dest": dest}
+
+
+def do_verify(image, expected=None, chunk=32 * MiB):
+    """Re-hash an image and compare it to its .sha256 sidecar (or an expected
+    value). This is how you confirm a rescue image is complete and not corrupt
+    before you start trusting it / reusing the original drive."""
+    import hashlib
+    if not os.path.isfile(image):
+        log("[verify] not a file: %s" % image)
+        return {"ok": False}
+    if expected is None:
+        side = image + ".sha256"
+        if os.path.isfile(side):
+            try:
+                with open(side) as f:
+                    expected = f.read().split()[0].strip().lower()
+            except Exception:
+                expected = None
+    size = os.path.getsize(image)
+    log("[verify] hashing %s (%s) ..." % (image, human(size)))
+    h = hashlib.sha256()
+    t0 = time.time()
+    last = t0
+    done = 0
+    with open(image, "rb") as f:
+        while True:
+            blk = f.read(chunk)
+            if not blk:
+                break
+            h.update(blk)
+            done += len(blk)
+            now = time.time()
+            if now - last >= 1.0:
+                last = now
+                rate = done / max(1e-6, now - t0)
+                eta = (size - done) / rate if rate > 0 else None
+                log("[verify]   %5.1f%%  (%s / %s)  %s/s  ETA %s" %
+                    (100.0 * done / max(1, size), human(done), human(size),
+                     human(rate), _fmt_eta(eta)))
+    digest = h.hexdigest()
+    log("[verify] sha256: %s" % digest)
+    if expected:
+        if digest.lower() == expected.lower():
+            log("[verify] RESULT: OK — image matches the expected hash. It is intact.")
+            return {"ok": True, "match": True, "sha256": digest, "size": size}
+        log("[verify] RESULT: MISMATCH — image does NOT match %s" % expected)
+        log("[verify] The image is corrupt or incomplete. Re-create it.")
+        return {"ok": True, "match": False, "sha256": digest, "size": size}
+    log("[verify] No expected hash found (no .sha256 sidecar). Computed it above;")
+    log("[verify] keep it to verify the image again later.")
+    return {"ok": True, "match": None, "sha256": digest, "size": size}
 
 
 # --------------------------------------------------------------------------- #
@@ -1693,6 +1947,138 @@ def _build_mft_record(name, parent, content, rec_size=1024):
     return bytes(rec)
 
 
+# -- richer record builders (named ADS, non-resident $DATA, $ATTRIBUTE_LIST) -- #
+
+def _enc_runs(runs):
+    """Encode [(length_clusters, start_lcn)] into NTFS data-run bytes."""
+    def ub(v):
+        return v.to_bytes(max(1, (v.bit_length() + 7) // 8), "little")
+
+    def sb(v):
+        n = 1
+        while not (-(1 << (8 * n - 1)) <= v < (1 << (8 * n - 1))):
+            n += 1
+        return v.to_bytes(n, "little", signed=True)
+
+    out = bytearray()
+    prev = 0
+    for length, lcn in runs:
+        lb, ob = ub(length), sb(lcn - prev)
+        prev = lcn
+        out.append((len(ob) << 4) | len(lb))
+        out += lb + ob
+    out.append(0)
+    return bytes(out)
+
+
+def _attr_resident(atype, content, name="", attr_id=0):
+    nm = name.encode("utf-16-le")
+    name_off = 0x18
+    content_off = ((name_off + len(nm) + 7) & ~7) if nm else 0x18
+    total = (content_off + len(content) + 7) & ~7
+    a = bytearray(total)
+    struct.pack_into("<I", a, 0x00, atype)
+    struct.pack_into("<I", a, 0x04, total)
+    a[0x08] = 0                                     # resident
+    a[0x09] = len(name)
+    struct.pack_into("<H", a, 0x0A, name_off if nm else 0)
+    struct.pack_into("<H", a, 0x0E, attr_id)
+    struct.pack_into("<I", a, 0x10, len(content))
+    struct.pack_into("<H", a, 0x14, content_off)
+    if nm:
+        a[name_off:name_off + len(nm)] = nm
+    a[content_off:content_off + len(content)] = content
+    return bytes(a)
+
+
+def _attr_nonresident(atype, runs, real_size, name="", attr_id=0):
+    nm = name.encode("utf-16-le")
+    runbytes = _enc_runs(runs)
+    name_off = 0x40
+    runs_off = (name_off + len(nm) + 7) & ~7
+    total = (runs_off + len(runbytes) + 7) & ~7
+    last_vcn = sum(l for l, _ in runs) - 1
+    alloc = sum(l for l, _ in runs) * 4096
+    a = bytearray(total)
+    struct.pack_into("<I", a, 0x00, atype)
+    struct.pack_into("<I", a, 0x04, total)
+    a[0x08] = 1                                     # non-resident
+    a[0x09] = len(name)
+    struct.pack_into("<H", a, 0x0A, name_off if nm else 0)
+    struct.pack_into("<H", a, 0x0E, attr_id)
+    struct.pack_into("<Q", a, 0x10, 0)             # start VCN
+    struct.pack_into("<Q", a, 0x18, last_vcn)      # last VCN
+    struct.pack_into("<H", a, 0x20, runs_off)
+    struct.pack_into("<Q", a, 0x28, alloc)
+    struct.pack_into("<Q", a, 0x30, real_size)
+    struct.pack_into("<Q", a, 0x38, real_size)     # initialized size
+    if nm:
+        a[name_off:name_off + len(nm)] = nm
+    a[runs_off:runs_off + len(runbytes)] = runbytes
+    return bytes(a)
+
+
+def _attr_stdinfo():
+    si = bytearray(0x48)
+    for o in (0x00, 0x08, 0x10, 0x18):
+        struct.pack_into("<Q", si, o, 133000000000000000)
+    return _attr_resident(ATTR_STANDARD_INFO, bytes(si))
+
+
+def _attr_filename(name, parent, size):
+    nm = name.encode("utf-16-le")
+    fn = bytearray(0x42 + len(nm))
+    struct.pack_into("<Q", fn, 0x00, parent)
+    struct.pack_into("<Q", fn, 0x30, size)
+    struct.pack_into("<Q", fn, 0x38, size)
+    fn[0x40] = len(name)
+    fn[0x41] = 1                                    # Win32 namespace
+    fn[0x42:0x42 + len(nm)] = nm
+    return _attr_resident(ATTR_FILE_NAME, bytes(fn))
+
+
+def _attr_list(entries):
+    out = bytearray()
+    for atype, ref_entry, start_vcn in entries:
+        e = bytearray(0x18)
+        struct.pack_into("<I", e, 0x00, atype)
+        struct.pack_into("<H", e, 0x04, 0x18)
+        e[0x07] = 0x1A
+        struct.pack_into("<Q", e, 0x08, start_vcn)
+        struct.pack_into("<Q", e, 0x10, ref_entry)
+        out += e
+    return _attr_resident(ATTR_ATTRIBUTE_LIST, bytes(out))
+
+
+def _mk_record(rec_num, attrs, is_dir=False, rec_size=1024):
+    rec = bytearray(rec_size)
+    attr_off = 0x38
+    off = attr_off
+    for a in attrs:
+        rec[off:off + len(a)] = a
+        off += len(a)
+    struct.pack_into("<I", rec, off, ATTR_END)
+    used = off + 8
+    rec[0:4] = b"FILE"
+    struct.pack_into("<H", rec, 0x04, 0x30)
+    struct.pack_into("<H", rec, 0x06, (rec_size // 512) + 1)
+    struct.pack_into("<H", rec, 0x10, 1)            # seq
+    struct.pack_into("<H", rec, 0x12, 1)            # link count
+    struct.pack_into("<H", rec, 0x14, attr_off)
+    struct.pack_into("<H", rec, 0x16, 0x03 if is_dir else 0x01)
+    struct.pack_into("<I", rec, 0x18, used)
+    struct.pack_into("<I", rec, 0x1C, rec_size)
+    struct.pack_into("<I", rec, 0x2C, rec_num)      # self entry number
+    usn = b"\x05\x05"
+    rec[0x30:0x32] = usn
+    cnt = (rec_size // 512) + 1
+    for i in range(1, cnt):
+        sec_end = i * 512 - 2
+        rec[0x30 + i * 2: 0x30 + i * 2 + 2] = rec[sec_end:sec_end + 2]
+        rec[sec_end:sec_end + 2] = usn
+    return bytes(rec)
+
+
 def selftest(outdir):
     os.makedirs(outdir, exist_ok=True)
     img_path = os.path.join(outdir, "synthetic.img")
@@ -1718,6 +2104,33 @@ def selftest(outdir):
                b"    function deposit() external payable { balances[msg.sender] += msg.value; }\n}\n")
     rec1 = _build_mft_record("Vault.sol", 5, sol_src)
     img[mft_off + 1024:mft_off + 1024 + len(rec1)] = rec1
+
+    # entry 2+3: a fragmented, NON-resident file whose $DATA lives in an
+    # extension record reached via $ATTRIBUTE_LIST (expert NTFS path).
+    frag_data = b"FRAGMENTED_NONRESIDENT_PAYLOAD " * 6     # ~186 bytes
+    frag_lcn = 384                                          # 384*4096 = 1.5 MiB
+    img[frag_lcn * 4096:frag_lcn * 4096 + len(frag_data)] = frag_data
+    base_rec = _mk_record(2, [
+        _attr_stdinfo(),
+        _attr_filename("bigfile.bin", 5, len(frag_data)),
+        _attr_list([(ATTR_STANDARD_INFO, 2, 0), (ATTR_FILE_NAME, 2, 0),
+                    (ATTR_DATA, 3, 0)]),
+    ])
+    img[mft_off + 2 * 1024:mft_off + 2 * 1024 + len(base_rec)] = base_rec
+    ext_rec = _mk_record(3, [
+        _attr_nonresident(ATTR_DATA, [(1, frag_lcn)], len(frag_data)),
+    ])
+    img[mft_off + 3 * 1024:mft_off + 3 * 1024 + len(ext_rec)] = ext_rec
+
+    # entry 4: a file carrying a named alternate data stream (ADS).
+    ads_payload = b"HIDDEN_ALTERNATE_STREAM_PAYLOAD"
+    ads_rec = _mk_record(4, [
+        _attr_stdinfo(),
+        _attr_filename("notes.txt", 5, 12),
+        _attr_resident(ATTR_DATA, b"cover text\r\n"),
+        _attr_resident(ATTR_DATA, ads_payload, name="secret", attr_id=3),
+    ])
+    img[mft_off + 4 * 1024:mft_off + 4 * 1024 + len(ads_rec)] = ads_rec
 
     # 3) A real ZIP somewhere in the "data" area
     zbuf = io.BytesIO()
@@ -1829,6 +2242,84 @@ def selftest(outdir):
     else:
         log("[selftest] PASS: video carved (mp4 box-walk)")
 
+    # 6b) Deep NTFS: $ATTRIBUTE_LIST-fragmented file + alternate data stream.
+    radv = Reader(img_path)
+    outadv = os.path.join(outdir, "out_adv")
+    os.makedirs(outadv, exist_ok=True)
+    madv = mine_mft(radv, outadv, carve_nonresident=True, regions=None)
+    radv.close()
+    adv_files = {}
+    for root, _, fs in os.walk(os.path.join(outadv, "10_mft", "files")):
+        for fn in fs:
+            try:
+                with open(os.path.join(root, fn), "rb") as fh:
+                    adv_files[fn] = fh.read()
+            except Exception:
+                adv_files[fn] = b""
+    if "bigfile.bin" in adv_files and frag_data[:32] in adv_files["bigfile.bin"]:
+        log("[selftest] PASS: fragmented non-resident file recovered via "
+            "$ATTRIBUTE_LIST extension record")
+    else:
+        ok = False
+        log("[selftest] FAIL: $ATTRIBUTE_LIST fragmented recovery (have %s)"
+            % list(adv_files))
+    ads_hit = any(name.endswith("_ADS_secret") and ads_payload in data
+                  for name, data in adv_files.items())
+    if ads_hit and madv.get("ads_recovered", 0) >= 1:
+        log("[selftest] PASS: alternate data stream (ADS) recovered")
+    else:
+        ok = False
+        log("[selftest] FAIL: ADS recovery (ads_recovered=%s)"
+            % madv.get("ads_recovered"))
+
+    # 7) Imaging: ddrescue-style per-sector recovery around a bad sector, then
+    #    a verify round-trip (match + mismatch detection).
+    class _BadReader(object):
+        """Wraps a real Reader but makes one 512-byte sector unreadable, exactly
+        like a failing drive: any read overlapping it comes back short/empty."""
+        def __init__(self, inner, bad_off, bad_len=512):
+            self.path, self.size, self.align = inner.path, inner.size, 512
+            self._inner, self._lo, self._hi = inner, bad_off, bad_off + bad_len
+
+        def read(self, off, length):
+            if off < self._hi and off + length > self._lo:
+                return b""
+            return self._inner.read(off, length)
+
+        def close(self):
+            self._inner.close()
+
+    src = Reader(img_path)
+    bad_off = 7 * MiB                                   # a zero region; safe to wound
+    badr = _BadReader(src, bad_off)
+    dst = os.path.join(outdir, "rescue.img")
+    ires = do_image(badr, dst, chunk=1 * MiB, sector=512, retries=1)
+    src.close()
+
+    with open(img_path, "rb") as f:
+        orig = f.read()
+    with open(dst, "rb") as f:
+        copy = f.read()
+    img_ok = (ires.get("ok") and len(copy) == len(orig)
+              and ires.get("unreadable") == 512 and ires.get("bad_regions") == 1
+              and copy[bad_off:bad_off + 512] == b"\x00" * 512
+              and copy[png_off:png_off + len(png)] == orig[png_off:png_off + len(png)]
+              and copy[mft_off:mft_off + 1024] == orig[mft_off:mft_off + 1024])
+    if img_ok:
+        log("[selftest] PASS: imaging recovered all good sectors; only the bad "
+            "512B sector was zero-filled (offsets preserved)")
+    else:
+        ok = False
+        log("[selftest] FAIL: imaging bad-sector recovery (%s)" % ires)
+
+    vres_ok = do_verify(dst)
+    vres_bad = do_verify(dst, expected="00" * 32)
+    if vres_ok.get("match") is True and vres_bad.get("match") is False:
+        log("[selftest] PASS: verify confirms a good image and rejects a wrong hash")
+    else:
+        ok = False
+        log("[selftest] FAIL: verify (good=%s bad=%s)" % (vres_ok, vres_bad))
+
     log("\n[selftest] %s" % ("ALL TESTS PASSED" if ok else "SOME TESTS FAILED"))
     return 0 if ok else 1
 
@@ -1906,6 +2397,17 @@ def main(argv=None):
     sp = sub.add_parser("image")
     sp.add_argument("--image", required=True, help="source device/image to copy (read-only)")
     sp.add_argument("--dest", required=True, help="destination .img file to create")
+    sp.add_argument("--sector", type=int, default=None,
+                    help="sector size for bad-block recovery (default: device align/512)")
+    sp.add_argument("--retries", type=int, default=2,
+                    help="re-read attempts per bad sector (default: 2)")
+    sp.add_argument("--resume", action="store_true",
+                    help="continue an interrupted image from where it stopped")
+
+    sp = sub.add_parser("verify")
+    sp.add_argument("--image", required=True, help="image file to verify")
+    sp.add_argument("--sha256", default=None,
+                    help="expected hash (default: read <image>.sha256 sidecar)")
 
     args = p.parse_args(argv)
     if not args.cmd:
@@ -1914,6 +2416,12 @@ def main(argv=None):
 
     if args.cmd == "selftest":
         return selftest(args.out)
+
+    if args.cmd == "verify":
+        res = do_verify(args.image, expected=args.sha256)
+        if not res.get("ok"):
+            return 1
+        return 0 if res.get("match") in (True, None) else 2
 
     if getattr(args, "out", None):
         os.makedirs(args.out, exist_ok=True)
@@ -1946,7 +2454,8 @@ def main(argv=None):
 
     if args.cmd == "image":
         try:
-            res = do_image(reader, args.dest)
+            res = do_image(reader, args.dest, sector=args.sector,
+                           retries=args.retries, resume=args.resume)
         finally:
             reader.close()
         return 0 if res.get("ok") else 1
