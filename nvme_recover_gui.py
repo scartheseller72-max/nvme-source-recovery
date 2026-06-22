@@ -28,6 +28,7 @@ import json
 import time
 import queue
 import shlex
+import shutil
 import threading
 import subprocess
 
@@ -133,11 +134,26 @@ def open_path(path):
         return False
 
 
+def base_disk(dev):
+    """Whole-disk node for a partition path: /dev/sdc2 -> /dev/sdc,
+    /dev/nvme0n1p2 -> /dev/nvme0n1."""
+    if not dev:
+        return dev
+    m = re.match(r"^(/dev/(?:nvme\d+n\d+|mmcblk\d+))p\d+$", dev)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(/dev/[a-z]+)\d+$", dev)
+    if m:
+        return m.group(1)
+    return dev
+
+
 def _detect_windows():
     out = []
     try:
         ps = ("Get-CimInstance Win32_DiskDrive | ForEach-Object "
-              "{ \"$($_.DeviceID)|$($_.Size)|$($_.Model)\" }")
+              "{ \"$($_.DeviceID)|$($_.Size)|$($_.Model)|$($_.SerialNumber)|"
+              "$($_.InterfaceType)\" }")
         res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                              capture_output=True, text=True, timeout=10)
         for line in res.stdout.splitlines():
@@ -147,8 +163,17 @@ def _detect_windows():
             dev = parts[0].strip()                      # \\.\PHYSICALDRIVE0
             size = parts[1].strip()
             model = parts[2].strip() if len(parts) > 2 else ""
+            serial = parts[3].strip() if len(parts) > 3 else ""
+            tran = parts[4].strip() if len(parts) > 4 else ""
             hs = human(int(size)) if size.isdigit() else size
-            out.append((dev, "%s  (%s%s)" % (dev, hs, "  " + model if model else "")))
+            label = "%s  ·  %s" % (dev, hs)
+            if model:
+                label += "  ·  " + model
+            if tran:
+                label += "  [%s]" % tran
+            if serial:
+                label += "  SN:" + serial[:16]
+            out.append((dev, label))
     except Exception:
         pass
     return out
@@ -174,19 +199,28 @@ def _detect_macos():
 def _detect_linux():
     out = []
     try:
-        res = subprocess.run(["lsblk", "-dpno", "NAME,SIZE,MODEL,TYPE"],
-                             capture_output=True, text=True, timeout=5)
+        # -P (key="value") survives spaces in model/vendor names.
+        res = subprocess.run(
+            ["lsblk", "-dpP", "-o", "NAME,SIZE,TYPE,TRAN,VENDOR,MODEL,SERIAL"],
+            capture_output=True, text=True, timeout=6)
         if res.returncode == 0:
             for line in res.stdout.splitlines():
-                parts = line.split(None, 3)
-                if len(parts) < 2:
+                kv = dict(re.findall(r'(\w+)="([^"]*)"', line))
+                if kv.get("TYPE") != "disk":
                     continue
-                name, size = parts[0], parts[1]
-                typ = parts[3] if len(parts) > 3 else ""
-                model = parts[2] if len(parts) > 2 else ""
-                if "disk" in (typ.lower() if typ else "") or "disk" in line.lower():
-                    out.append((name, "%s  (%s%s)" % (name, size,
-                                "  " + model if model else "")))
+                name = kv.get("NAME", "")
+                if not name:
+                    continue
+                ident = (kv.get("VENDOR", "").strip() + " " +
+                         kv.get("MODEL", "").strip()).strip()
+                label = "%s  ·  %s" % (name, kv.get("SIZE", "?"))
+                if ident:
+                    label += "  ·  " + ident
+                if kv.get("TRAN"):
+                    label += "  [%s]" % kv["TRAN"]
+                if kv.get("SERIAL", "").strip():
+                    label += "  SN:" + kv["SERIAL"].strip()[:16]
+                out.append((name, label))
             if out:
                 return out
     except Exception:
@@ -204,6 +238,32 @@ def detect_block_devices():
     if IS_MAC:
         return _detect_macos()
     return _detect_linux()
+
+
+def device_size_bytes(dev):
+    """Best-effort byte size of a block device (Linux/macOS)."""
+    try:
+        if IS_WINDOWS:
+            return None
+        r = subprocess.run(["lsblk", "-bdno", "SIZE", dev],
+                           capture_output=True, text=True, timeout=8)
+        return int(r.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def dest_backing_disk(path):
+    """Whole disk that backs a destination directory/file (Linux), or None."""
+    try:
+        r = subprocess.run(["df", "--output=source", path],
+                           capture_output=True, text=True, timeout=8)
+        lines = r.stdout.strip().splitlines()
+        if len(lines) >= 2 and lines[1].startswith("/dev/"):
+            return base_disk(lines[1].strip())
+    except Exception:
+        pass
+    return None
+
 
 
 def load_settings():
@@ -507,8 +567,11 @@ class App(object):
         brow = ttk.Frame(inner, style="Panel.TFrame")
         brow.pack(fill="x")
         ttk.Button(brow, text="Browse image…", command=self._pick_image).pack(side="left")
-        ttk.Button(brow, text="① Image drive → .img",
-                   command=self._image_drive).pack(side="left", padx=(6, 0))
+        ttk.Button(brow, text="Identify disk", command=self._identify_disk).pack(side="left", padx=(6, 0))
+        brow2 = ttk.Frame(inner, style="Panel.TFrame")
+        brow2.pack(fill="x", pady=(4, 0))
+        ttk.Button(brow2, text="① Image drive → .img",
+                   command=self._image_drive).pack(side="left")
         dev_hint = ("Pick a forensic .img, or a detected disk "
                     "(\\\\.\\PhysicalDriveN — run as Administrator).\n"
                     "Tip: image the drive first, then recover from the safe copy." if IS_WINDOWS
@@ -713,9 +776,47 @@ class App(object):
     # -- actions ----------------------------------------------------------- #
     def _refresh_devices(self):
         devs = detect_block_devices()
-        self.src_combo["values"] = [d[0] for d in devs]
-        self._set_status("Found %d block device(s)." % len(devs) if devs
-                         else "No block devices detected — browse for an image.")
+        # Show the rich label (path · size · model · [bus] · serial) in the list,
+        # but keep a label->path map so we run against the real device node.
+        self._dev_by_label = {label: path for path, label in devs}
+        self.src_combo["values"] = [label for _path, label in devs]
+        self._set_status("Found %d disk(s). Pick yours by size/model." % len(devs)
+                         if devs else "No disks detected — browse for an image, "
+                         "or run as root/Administrator.")
+
+    def _source_path(self):
+        """Resolve whatever is shown in the source box to a real path/device node."""
+        raw = self.src_var.get().strip()
+        return getattr(self, "_dev_by_label", {}).get(raw, raw)
+
+    def _identify_disk(self):
+        dev = self._source_path()
+        if not dev or not self._is_device(dev):
+            messagebox.showinfo("Identify disk",
+                                "Pick a disk from the list first (not an image file), "
+                                "then Identify shows its partitions so you can confirm "
+                                "it's the right drive.")
+            return
+        self._set_status("Identifying %s…" % dev)
+        threading.Thread(target=self._identify_worker, args=(dev,), daemon=True).start()
+
+    def _identify_worker(self, dev):
+        if IS_WINDOWS:
+            cmd = ["powershell", "-NoProfile", "-Command",
+                   "Get-CimInstance Win32_DiskDrive | Where-Object DeviceID -eq "
+                   "'%s' | Format-List Model,SerialNumber,Size,InterfaceType,Partitions"
+                   % dev]
+        elif IS_MAC:
+            cmd = ["diskutil", "info", dev]
+        else:
+            cmd = ["lsblk", "-o",
+                   "NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT,MODEL,SERIAL,TRAN", dev]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            out = (r.stdout or "") + (r.stderr or "")
+        except Exception as exc:
+            out = str(exc)
+        self.q.put(("identify", (dev, out.strip())))
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
@@ -738,7 +839,7 @@ class App(object):
         return src.startswith(("/dev/", "\\\\.\\", "\\\\?\\"))
 
     def _validate(self):
-        src = self.src_var.get().strip()
+        src = self._source_path()
         out = self.out_var.get().strip()
         is_dev = self._is_device(src)
         if not src or (not is_dev and not os.path.exists(src)):
@@ -806,7 +907,7 @@ class App(object):
 
     def _image_drive(self):
         """Create a read-only raw image of the selected disk/partition first."""
-        src = self.src_var.get().strip()
+        src = self._source_path()
         if not src or (not self._is_device(src) and not os.path.exists(src)):
             messagebox.showerror("Source missing",
                                  "Select the disk / device (or an image) to copy first.")
@@ -815,22 +916,61 @@ class App(object):
             messagebox.showerror("Engine missing",
                                  "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
             return
+        if self._is_device(src) and not IS_WINDOWS:
+            messagebox.showinfo(
+                "Where to save the image",
+                "Pick a destination on a SEPARATE drive with enough free space — "
+                "NOT the drive you're imaging, and ideally not the live-USB you "
+                "booted from.\n\nOn a live session, plug in a third drive and mount "
+                "it first (Files app, or: sudo mount /dev/sdX1 /mnt). It then shows "
+                "up in the save dialog under /mnt or /media.")
         initial = (self.out_var.get().strip() or os.path.expanduser("~"))
         dest = filedialog.asksaveasfilename(
-            title="Save disk image as…", defaultextension=".img",
+            title="Save disk image as…  (choose a SEPARATE drive)",
+            defaultextension=".img",
             initialdir=initial if os.path.isdir(initial) else os.path.expanduser("~"),
             initialfile="rescue.img",
             filetypes=[("Raw disk image", "*.img"), ("All files", "*")])
         if not dest:
             return
+        destdir = os.path.dirname(os.path.abspath(dest)) or "."
+
+        # Safety: never write the image onto the very disk we're imaging.
+        if self._is_device(src) and not IS_WINDOWS:
+            src_disk = base_disk(src)
+            dest_disk = dest_backing_disk(destdir)
+            if dest_disk and src_disk and dest_disk == src_disk:
+                messagebox.showerror(
+                    "Unsafe destination",
+                    "That destination lives on the SAME disk you're imaging (%s).\n\n"
+                    "Writing the image there would overwrite the data you're trying "
+                    "to recover. Choose a different drive." % src_disk)
+                return
+
+        # Capacity check: does the image fit?
+        src_bytes = (device_size_bytes(src) if self._is_device(src)
+                     else (os.path.getsize(src) if os.path.isfile(src) else None))
+        try:
+            free = shutil.disk_usage(destdir).free
+        except Exception:
+            free = None
+        if src_bytes and free is not None and free < src_bytes:
+            if not messagebox.askyesno(
+                    "Not enough free space?",
+                    "The source is %s but the destination only has %s free.\n\n"
+                    "The image likely won't fit. Continue anyway?"
+                    % (human(src_bytes), human(free))):
+                return
+
         if self._is_device(src):
             note = ("\n\nWindows: the GUI must be running as Administrator to read it."
                     if IS_WINDOWS else "")
+            sz = "  (%s)" % human(src_bytes) if src_bytes else ""
             if not messagebox.askyesno(
                     "Create read-only image?",
-                    "Read %s and write a full image to:\n%s\n\n"
+                    "Read %s%s and write a full image to:\n%s\n\n"
                     "The source is opened READ-ONLY and never modified.%s\n\nProceed?"
-                    % (src, dest, note)):
+                    % (src, sz, dest, note)):
                 return
         argv = engine_argv("image", "--image", src, "--dest", dest)
         self._after_image_dest = dest
@@ -1025,6 +1165,13 @@ class App(object):
             self._append("warn", "  %s\n" % text)
         elif kind == "err":
             self._append("err", "  %s\n" % text)
+        elif kind == "identify":
+            dev, out = text
+            self.nb.select(0)
+            self._append("phase", "\n▸ Identify %s\n" % dev)
+            self._append("log", out + "\n")
+            self._set_status("Identified %s — see the log to confirm it's your drive." % dev)
+            messagebox.showinfo("Disk: %s" % dev, out or "No details available.")
         elif kind == "trim_result":
             action, rc, out, state = text
             self.nb.select(0)
