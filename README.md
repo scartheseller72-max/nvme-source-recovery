@@ -183,10 +183,15 @@ sudo python3 trim_control.py enable    # restore after recovery
 
 **Image the drive first, from the GUI.** Click **① Image drive → .img**
 (or Run ▸ Image drive…) to make a read-only raw copy of the selected disk /
-partition to a `.img` file, with live progress and a `.sha256` sidecar. When it
-finishes, the Source field automatically switches to the new image so you then
-recover from the safe copy — never the original drive. On Windows, reading a
-physical drive needs the GUI started **as Administrator**.
+partition to a `.img` file, with live progress and a `.sha256` sidecar. A
+**destination-drive picker** lists every mounted, writable drive (with free
+space and model) so — even on a Linux live USB — you can send the image
+straight to a separate external drive instead of the live USB; if your drive
+isn't listed, mount it and press **Refresh**, or use **Browse…**. The GUI
+refuses a destination on the same disk you're imaging and warns if it won't
+fit. When it finishes, the Source field automatically switches to the new image
+so you then recover from the safe copy — never the original drive. On Windows,
+reading a physical drive needs the GUI started **as Administrator**.
 
 | | |
 | --- | --- |

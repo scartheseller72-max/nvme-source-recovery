@@ -265,6 +265,102 @@ def dest_backing_disk(path):
     return None
 
 
+def detect_writable_mounts(exclude_disk=None):
+    """Best-effort list of plausible DESTINATION drives (where a rescue image
+    can be saved): mounted, writable, real filesystems on a different disk than
+    the one being imaged. Returns [(mountpoint, label, free_bytes, disk)]."""
+    if IS_WINDOWS:
+        return _writable_mounts_windows(exclude_disk)
+    if IS_MAC:
+        return _writable_mounts_macos(exclude_disk)
+    return _writable_mounts_linux(exclude_disk)
+
+
+def _mount_entry(mp, free, total, extra, disk):
+    label = "%s  ·  free %s / %s" % (mp, human(free), human(total))
+    if extra:
+        label += "  ·  " + extra
+    return (mp, label, free, disk)
+
+
+def _writable_mounts_linux(exclude_disk):
+    out = []
+    try:
+        res = subprocess.run(
+            ["lsblk", "-pP", "-o",
+             "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,RO,RM,MODEL,VENDOR,LABEL"],
+            capture_output=True, text=True, timeout=6)
+        for line in res.stdout.splitlines():
+            kv = dict(re.findall(r'(\w+)="([^"]*)"', line))
+            mp = kv.get("MOUNTPOINT", "").strip()
+            if not mp or kv.get("RO") == "1":
+                continue
+            fst = kv.get("FSTYPE", "").strip()
+            if not fst or fst == "swap":
+                continue
+            # skip the live OS / system mounts; we want data drives only
+            if mp == "/" or mp.startswith(("/boot", "/proc", "/sys",
+                                           "/run", "/dev", "/var", "/snap")):
+                continue
+            disk = base_disk(kv.get("NAME", ""))
+            if exclude_disk and disk == exclude_disk:
+                continue
+            if not os.access(mp, os.W_OK):
+                continue
+            try:
+                du = shutil.disk_usage(mp)
+            except Exception:
+                continue
+            ident = (kv.get("VENDOR", "").strip() + " " +
+                     kv.get("MODEL", "").strip()).strip()
+            extra = ident
+            if kv.get("LABEL", "").strip():
+                extra = (extra + "  “%s”" % kv["LABEL"].strip()).strip()
+            out.append(_mount_entry(mp, du.free, du.total, extra or fst, disk))
+    except Exception:
+        pass
+    # Fallback: probe the usual removable-media roots directly.
+    if not out:
+        for root in ("/media", "/mnt", "/run/media"):
+            for sub in sorted(glob.glob(os.path.join(root, "*")) +
+                              glob.glob(os.path.join(root, "*", "*"))):
+                if os.path.ismount(sub) and os.access(sub, os.W_OK):
+                    try:
+                        du = shutil.disk_usage(sub)
+                    except Exception:
+                        continue
+                    out.append(_mount_entry(sub, du.free, du.total, "", None))
+    return out
+
+
+def _writable_mounts_macos(exclude_disk):
+    out = []
+    for sub in sorted(glob.glob("/Volumes/*")):
+        if not os.path.isdir(sub) or not os.access(sub, os.W_OK):
+            continue
+        try:
+            du = shutil.disk_usage(sub)
+        except Exception:
+            continue
+        out.append(_mount_entry(sub, du.free, du.total,
+                                os.path.basename(sub), None))
+    return out
+
+
+def _writable_mounts_windows(exclude_disk):
+    out = []
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        root = "%s:\\" % letter
+        if not os.path.isdir(root):
+            continue
+        try:
+            du = shutil.disk_usage(root)
+        except Exception:
+            continue
+        out.append(_mount_entry(root, du.free, du.total, "", None))
+    return out
+
+
 
 def load_settings():
     try:
@@ -905,6 +1001,79 @@ class App(object):
         self.last_out = os.path.join(out, "out")
         self._start_jobs([("Self-test", argv)])
 
+    def _choose_dest_dir(self, src_disk, min_bytes, initial):
+        """Modal picker that lists mounted, writable destination drives so the
+        user can save the rescue image to a SEPARATE drive without hunting
+        through the file dialog. Returns a directory path, or None if cancelled."""
+        win = tk.Toplevel(self.root)
+        win.title("Choose destination drive")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+        result = {"dir": None}
+
+        ttk.Label(win, text="Where should the rescue image be saved?",
+                  style="H2.TLabel").pack(anchor="w", padx=14, pady=(12, 2))
+        ttk.Label(win, wraplength=520, style="Mute.TLabel",
+                  text=("Pick a SEPARATE drive with enough free space — NOT the drive "
+                        "you're imaging, and ideally not the live-USB you booted from.\n"
+                        "Don't see your drive? Plug it in and mount it (Files app, or: "
+                        "sudo mount /dev/sdX1 /mnt), then press Refresh.")
+                  ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        lb = tk.Listbox(win, width=72, height=7, activestyle="none",
+                        bg=BG_INPUT, fg=FG, selectbackground=ACCENT,
+                        selectforeground="#06121f", highlightthickness=1,
+                        highlightbackground=BORDER, relief="flat",
+                        font=self.f_mono)
+        lb.pack(fill="x", padx=14)
+        rows = []
+
+        def refill():
+            lb.delete(0, "end")
+            del rows[:]
+            mounts = detect_writable_mounts(exclude_disk=src_disk)
+            if not mounts:
+                lb.insert("end", "  (no extra drives detected — use Browse… below)")
+                rows.append(None)
+            for mp, label, free, _disk in mounts:
+                tag = "   ⚠ may not fit" if (min_bytes and free < min_bytes) else ""
+                lb.insert("end", "  " + label + tag)
+                rows.append(mp)
+            if rows and rows[0]:
+                lb.selection_set(0)
+
+        def use_selected():
+            sel = lb.curselection()
+            if sel and rows[sel[0]]:
+                result["dir"] = rows[sel[0]]
+                win.destroy()
+
+        def browse():
+            d = filedialog.askdirectory(
+                parent=win, title="Choose destination folder",
+                initialdir=initial if os.path.isdir(initial) else "/")
+            if d:
+                result["dir"] = d
+                win.destroy()
+
+        lb.bind("<Double-Button-1>", lambda _e: use_selected())
+        refill()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=14, pady=12)
+        ttk.Button(btns, text="Refresh", command=refill).pack(side="left")
+        ttk.Button(btns, text="Browse…", command=browse).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel",
+                   command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="Use this drive", style="Accent.TButton",
+                   command=use_selected).pack(side="right", padx=6)
+
+        win.update_idletasks()
+        win.grab_set()
+        win.wait_window()
+        return result["dir"]
+
     def _image_drive(self):
         """Create a read-only raw image of the selected disk/partition first."""
         src = self._source_path()
@@ -916,19 +1085,25 @@ class App(object):
             messagebox.showerror("Engine missing",
                                  "Cannot find nvme_recover.py next to this GUI:\n%s" % ENGINE)
             return
-        if self._is_device(src) and not IS_WINDOWS:
-            messagebox.showinfo(
-                "Where to save the image",
-                "Pick a destination on a SEPARATE drive with enough free space — "
-                "NOT the drive you're imaging, and ideally not the live-USB you "
-                "booted from.\n\nOn a live session, plug in a third drive and mount "
-                "it first (Files app, or: sudo mount /dev/sdX1 /mnt). It then shows "
-                "up in the save dialog under /mnt or /media.")
+
+        src_disk = base_disk(src) if (self._is_device(src) and not IS_WINDOWS) else None
+        src_bytes = (device_size_bytes(src) if self._is_device(src)
+                     else (os.path.getsize(src) if os.path.isfile(src) else None))
         initial = (self.out_var.get().strip() or os.path.expanduser("~"))
+
+        # For a live device, lead with the drive picker so the destination is
+        # always a real, mounted, SEPARATE drive (the live-USB pain point).
+        if self._is_device(src):
+            destdir0 = self._choose_dest_dir(src_disk, src_bytes, initial)
+            if not destdir0:
+                return
+        else:
+            destdir0 = initial
+
         dest = filedialog.asksaveasfilename(
             title="Save disk image as…  (choose a SEPARATE drive)",
             defaultextension=".img",
-            initialdir=initial if os.path.isdir(initial) else os.path.expanduser("~"),
+            initialdir=destdir0 if os.path.isdir(destdir0) else os.path.expanduser("~"),
             initialfile="rescue.img",
             filetypes=[("Raw disk image", "*.img"), ("All files", "*")])
         if not dest:
@@ -936,10 +1111,9 @@ class App(object):
         destdir = os.path.dirname(os.path.abspath(dest)) or "."
 
         # Safety: never write the image onto the very disk we're imaging.
-        if self._is_device(src) and not IS_WINDOWS:
-            src_disk = base_disk(src)
+        if src_disk:
             dest_disk = dest_backing_disk(destdir)
-            if dest_disk and src_disk and dest_disk == src_disk:
+            if dest_disk and dest_disk == src_disk:
                 messagebox.showerror(
                     "Unsafe destination",
                     "That destination lives on the SAME disk you're imaging (%s).\n\n"
@@ -948,8 +1122,6 @@ class App(object):
                 return
 
         # Capacity check: does the image fit?
-        src_bytes = (device_size_bytes(src) if self._is_device(src)
-                     else (os.path.getsize(src) if os.path.isfile(src) else None))
         try:
             free = shutil.disk_usage(destdir).free
         except Exception:
