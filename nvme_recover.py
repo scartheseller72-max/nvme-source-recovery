@@ -114,14 +114,47 @@ def unique_path(path):
         i += 1
 
 
+def _makedirs_resilient(target, root):
+    """Create the directory `target` under `root`, component by component. If any
+    ancestor already exists as a FILE (a file-vs-directory name clash — common
+    when recovered names are garbled, e.g. the Unicode replacement char), the
+    clashing component is given a unique alternate name so creation proceeds.
+    Returns the directory actually created."""
+    target = os.path.normpath(target)
+    root = os.path.normpath(root)
+    os.makedirs(root, exist_ok=True)
+    rel = os.path.relpath(target, root)
+    if rel in (".", ""):
+        return root
+    cur = root
+    for comp in rel.split(os.sep):
+        if comp in ("", ".", ".."):
+            continue
+        nxt = os.path.join(cur, comp)
+        if os.path.isdir(nxt):
+            cur = nxt
+            continue
+        if os.path.exists(nxt):                 # exists but is a file -> clash
+            nxt = unique_path(nxt + "_dir")
+        try:
+            os.mkdir(nxt)
+        except FileExistsError:
+            nxt = unique_path(nxt + "_dir")
+            os.mkdir(nxt)
+        cur = nxt
+    return cur
+
+
 def safe_write(outroot, relpath, data):
-    """Write data under outroot/relpath, defeating path traversal. Returns final path."""
+    """Write data under outroot/relpath, defeating path traversal. Returns final
+    path. Resilient to file/dir name clashes among recovered (often garbled)
+    names — it never raises just because two items sanitize to the same name."""
     relpath = sanitize_relpath(relpath)
     full = os.path.normpath(os.path.join(outroot, relpath))
     if not (full == outroot or full.startswith(outroot + os.sep)):
         full = os.path.join(outroot, os.path.basename(relpath) or "unnamed")
-    os.makedirs(os.path.dirname(full), exist_ok=True)
-    full = unique_path(full)
+    parent = _makedirs_resilient(os.path.dirname(full) or outroot, outroot)
+    full = unique_path(os.path.join(parent, os.path.basename(full) or "unnamed"))
     with open(full, "wb") as f:
         f.write(data)
     return full
@@ -864,42 +897,47 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
             rec_path = ""
             note = ""
 
-            if info["resident_data"] is not None and len(info["resident_data"]) > 0:
-                # FULL intact recovery of a small file
-                content = info["resident_data"][:size] if size else info["resident_data"]
-                rec_path = safe_write(files_dir, path or name, content)
-                resident_recovered += 1
-                recovered = "yes"
-                note = "RESIDENT (intact)"
-            elif carve_nonresident and info["data_runs"]:
-                buf = carve_runs(info["data_runs"], size)
-                if buf and buf.count(0) < len(buf):   # not all zeros -> something survived
-                    rec_path = safe_write(files_dir, path or name, bytes(buf))
-                    targeted_recovered += 1
-                    recovered = "partial/full"
-                    note = "TARGETED carve from data runs"
-                    if info.get("attr_list"):
-                        note += " (+$ATTRIBUTE_LIST)"
+            try:
+                if info["resident_data"] is not None and len(info["resident_data"]) > 0:
+                    # FULL intact recovery of a small file
+                    content = info["resident_data"][:size] if size else info["resident_data"]
+                    rec_path = safe_write(files_dir, path or name, content)
+                    resident_recovered += 1
+                    recovered = "yes"
+                    note = "RESIDENT (intact)"
+                elif carve_nonresident and info["data_runs"]:
+                    buf = carve_runs(info["data_runs"], size)
+                    if buf and buf.count(0) < len(buf):   # not all zeros -> something survived
+                        rec_path = safe_write(files_dir, path or name, bytes(buf))
+                        targeted_recovered += 1
+                        recovered = "partial/full"
+                        note = "TARGETED carve from data runs"
+                        if info.get("attr_list"):
+                            note += " (+$ATTRIBUTE_LIST)"
+                    else:
+                        targeted_zero += 1
+                        recovered = "no"
+                        note = "data clusters TRIMed (read as zero)"
                 else:
-                    targeted_zero += 1
-                    recovered = "no"
-                    note = "data clusters TRIMed (read as zero)"
-            else:
-                note = "non-resident; run with --carve-nonresident to attempt"
+                    note = "non-resident; run with --carve-nonresident to attempt"
 
-            # Recover alternate data streams (where attackers/tools hide data).
-            for s in info.get("ads", []):
-                sdata = None
-                if s.get("resident") is not None:
-                    sdata = s["resident"]
-                elif carve_nonresident and s.get("runs"):
-                    cb = carve_runs(s["runs"], s.get("size", 0))
-                    if cb and cb.count(0) < len(cb):
-                        sdata = bytes(cb)
-                if sdata:
-                    safe_write(files_dir, (path or name) + "_ADS_" +
-                               (s.get("name") or "stream"), sdata)
-                    ads_recovered += 1
+                # Recover alternate data streams (where data is often hidden).
+                for s in info.get("ads", []):
+                    sdata = None
+                    if s.get("resident") is not None:
+                        sdata = s["resident"]
+                    elif carve_nonresident and s.get("runs"):
+                        cb = carve_runs(s["runs"], s.get("size", 0))
+                        if cb and cb.count(0) < len(cb):
+                            sdata = bytes(cb)
+                    if sdata:
+                        safe_write(files_dir, (path or name) + "_ADS_" +
+                                   (s.get("name") or "stream"), sdata)
+                        ads_recovered += 1
+            except Exception as exc:
+                # One garbled record must never abort the whole phase.
+                recovered = recovered or "error"
+                note = (note + " | " if note else "") + ("write error: %s" % exc)
 
             w.writerow([path, entry, size, info["is_dir"], info["in_use"],
                         "resident" if info["resident_data"] is not None else "non-resident",
@@ -2271,6 +2309,23 @@ def selftest(outdir):
         ok = False
         log("[selftest] FAIL: ADS recovery (ads_recovered=%s)"
             % madv.get("ads_recovered"))
+
+    # 6c) Writer must survive file-vs-directory name clashes (garbled names)
+    #     without crashing — the bug that aborted a real mft run mid-phase.
+    clash_dir = os.path.join(outdir, "clash")
+    try:
+        p1 = safe_write(clash_dir, "node", b"i am a file")          # file 'node'
+        p2 = safe_write(clash_dir, "node/inner.txt", b"need dir")   # 'node' as dir
+        p3 = safe_write(clash_dir, "node", b"second file too")      # clashes again
+        if (os.path.isfile(p1) and os.path.isfile(p2) and os.path.isfile(p3)
+                and open(p2, "rb").read() == b"need dir"):
+            log("[selftest] PASS: writer resolves file/dir name clashes safely")
+        else:
+            ok = False
+            log("[selftest] FAIL: writer clash handling (%s, %s, %s)" % (p1, p2, p3))
+    except Exception as exc:
+        ok = False
+        log("[selftest] FAIL: writer raised on name clash: %s" % exc)
 
     # 7) Imaging: ddrescue-style per-sector recovery around a bad sector, then
     #    a verify round-trip (match + mismatch detection).
