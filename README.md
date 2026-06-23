@@ -384,6 +384,20 @@ modified / accessed / MFT-changed) and the entry number per file. It follows
 **complete** data-run list (not just the fragment in the base record), and it
 recovers **alternate data streams (ADS)** alongside the main stream.
 
+On a **whole-disk image with several volumes** (e.g. `C:` + `D:`), every record
+is matched to *its own* partition, so paths and cluster runs use the correct
+offset and cluster size — a file on `D:` is never carved from `C:`'s clusters.
+`mft` and `usn` always scan the **entire** image (never just the live extents),
+because those records survive in regions a zero-map marks as "dead".
+
+### Robust & safe by construction
+
+Every signature/record is processed **exactly once** — window boundaries no
+longer double-count or drop items. Archive and stream carving is **bounded**
+(a corrupt or hostile member can't decompress into unbounded memory), recovered
+names that collide as both a file and a folder are de-conflicted instead of
+crashing, and a single malformed record can never abort a whole phase.
+
 ---
 
 ## Realism assessment

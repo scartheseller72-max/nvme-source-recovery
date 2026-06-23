@@ -325,8 +325,14 @@ class Reader(object):
 
 
 def iter_windows(reader, extents, window=16 * MiB, overlap=1 * MiB):
-    """Yield (abs_offset, data) windows over the given extents, with overlap so
-    signatures spanning a boundary are fully present in at least one window."""
+    """Yield (abs_offset, data, valid_len) windows over the given extents.
+
+    `data` includes `overlap` trailing bytes so a signature/record that starts
+    inside this window but spills past its end is fully present. `valid_len` is
+    how many leading bytes this window *owns*: callers must ignore matches whose
+    start index is >= valid_len (the next window owns them), which makes every
+    offset processed exactly once — no duplicates at window boundaries.
+    """
     for (s, e) in extents:
         s = max(0, s)
         e = min(reader.size, e)
@@ -334,7 +340,7 @@ def iter_windows(reader, extents, window=16 * MiB, overlap=1 * MiB):
         while pos < e:
             n = min(window, e - pos)
             data = reader.read(pos, n + overlap)
-            yield pos, data
+            yield pos, data, n
             pos += n
 
 
@@ -346,15 +352,14 @@ def shannon_entropy(data):
     if not data:
         return 0.0
     import math
-    counts = [0] * 256
-    for b in data:
-        counts[b] += 1
+    from collections import Counter
     n = len(data)
+    # Counter() histograms the bytes in C — far faster than a Python byte loop,
+    # which matters when analyze samples hundreds of thousands of blocks.
     ent = 0.0
-    for c in counts:
-        if c:
-            p = c / n
-            ent -= p * math.log2(p)
+    for c in Counter(data).values():
+        p = c / n
+        ent -= p * math.log2(p)
     return ent
 
 
@@ -738,32 +743,65 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
     files_dir = os.path.join(m_dir, "files")
     os.makedirs(files_dir, exist_ok=True)
 
-    if geom is None:
+    # Discover ALL NTFS partitions so a whole-disk image (e.g. C: + D:) uses the
+    # CORRECT geometry per record. Cluster runs and entry numbers are relative to
+    # the partition the record belongs to — using one partition's offset/cluster
+    # size for another silently carves garbage from the wrong location.
+    if geom is not None:
+        parts = [geom]
+    else:
         parts = find_ntfs_partitions(reader)
-        geom = parts[0] if parts else {"bytes_per_cluster": 4096, "part_offset": 0,
-                                        "mft_record_size": 1024}
-        if parts:
-            log("[mft] NTFS found: cluster=%s, MFT@offset %d (record %dB)" %
-                (human(geom["bytes_per_cluster"]), geom["mft_offset"], geom["mft_record_size"]))
-        else:
+        if not parts:
+            parts = [{"bytes_per_cluster": 4096, "part_offset": 0,
+                      "mft_record_size": 1024, "mft_offset": None}]
             log("[mft] No NTFS boot sector found; assuming cluster=4096, record=1024")
-    bpc = geom.get("bytes_per_cluster", 4096)
-    rec_size = geom.get("mft_record_size", 1024) or 1024
+    for p in parts:
+        p.setdefault("part_offset", 0)
+        p.setdefault("bytes_per_cluster", 4096)
+        p.setdefault("mft_record_size", 1024)
+        p.setdefault("mft_offset", None)
+    parts.sort(key=lambda q: q["part_offset"])
+    for i, p in enumerate(parts):
+        secsz = p.get("bytes_per_sector", 512) or 512
+        size = p.get("total_sectors", 0) * secsz
+        nxt = parts[i + 1]["part_offset"] if i + 1 < len(parts) else reader.size
+        p["_start"] = p["part_offset"]
+        p["_end"] = min(p["part_offset"] + size, nxt) if size > 0 else nxt
+    default_part = parts[0]
+    for p in parts:
+        if p.get("mft_offset") is not None:
+            log("[mft] NTFS partition @%s: cluster=%s, MFT@%s, record %dB" %
+                (human(p["part_offset"]), human(p["bytes_per_cluster"]),
+                 human(p["mft_offset"]), p["mft_record_size"]))
+
+    _gc = {"p": default_part}
+
+    def geom_for(off):
+        last = _gc["p"]
+        if last["_start"] <= off < last["_end"]:
+            return last
+        for p in parts:
+            if p["_start"] <= off < p["_end"]:
+                _gc["p"] = p
+                return p
+        return default_part
+
+    rec_size = default_part.get("mft_record_size", 1024) or 1024
 
     # Scan extents (or whole image) for 'FILE' record signatures.
     extents = regions if regions else [(0, reader.size)]
     by_offset = []        # named records -> user-facing files
-    entry_index = {}      # MFT entry number -> info (ALL records, incl. extension)
-    mft_off = geom.get("mft_offset")
+    entry_index = {}      # (partition, entry number) -> info (incl. extension recs)
     found = 0
     scanned = 0
 
     log("[mft] scanning for MFT records (record size %dB)..." % rec_size)
-    for base, data in iter_windows(reader, extents, window=32 * MiB, overlap=rec_size):
+    for base, data, valid in iter_windows(reader, extents, window=32 * MiB,
+                                          overlap=rec_size):
         start = 0
         while True:
             idx = data.find(b"FILE", start)
-            if idx == -1:
+            if idx == -1 or idx >= valid:
                 break
             start = idx + 4
             abs_off = base + idx
@@ -782,18 +820,24 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
             if not info:
                 continue
             info["offset"] = abs_off
-            # Index by entry number so $ATTRIBUTE_LIST can reach extension
-            # records (which may carry the real $DATA runs). Works when the MFT
-            # is contiguous; fall back to the record's self-reported number.
+            # Index by (partition, entry number) so $ATTRIBUTE_LIST can reach
+            # extension records (which may carry the real $DATA runs), and so
+            # path/cluster math uses the right partition. Entry from offset when
+            # the MFT is contiguous; else fall back to the self-reported number.
+            g = geom_for(abs_off)
+            rsz = g.get("mft_record_size") or rec_size
+            moff = g.get("mft_offset")
             entry = None
-            if mft_off is not None:
-                rel = abs_off - mft_off
-                if rel >= 0 and rel % rec_size == 0:
-                    entry = rel // rec_size
+            if moff is not None:
+                rel = abs_off - moff
+                if rel >= 0 and rel % rsz == 0:
+                    entry = rel // rsz
             if entry is None and info.get("rec_num"):
                 entry = info["rec_num"]
+            info["_part"] = g
+            info["_entry"] = entry
             if entry is not None:
-                entry_index[entry] = info
+                entry_index[(id(g), entry)] = info
             if not info["names"]:           # extension/nameless record: indexed only
                 continue
             by_offset.append(info)
@@ -813,7 +857,8 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
         """Pull $DATA that lives in extension records referenced by this record's
         $ATTRIBUTE_LIST, so fragmented/large non-resident files get their full
         run list. Returns True if anything was merged."""
-        own = info.get("rec_num")
+        own = info.get("_entry")
+        pid = id(info["_part"])
         data_refs = sorted(
             (vcn, ref) for (atype, vcn, ref) in info.get("attr_list", [])
             if atype == ATTR_DATA)
@@ -822,7 +867,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
         for _vcn, ref in data_refs:
             if ref == own:
                 continue
-            ext = entry_index.get(ref)
+            ext = entry_index.get((pid, ref))
             if not ext or ext is info:
                 continue
             if ext.get("resident_data") is not None and info["resident_data"] is None:
@@ -848,21 +893,25 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
         name, parent = pick_name(info["names"])
         if depth > 64:
             return name
-        if parent == 5 or parent == 0 or parent not in entry_index:
+        key = (id(info["_part"]), parent)
+        if parent in (0, 5) or key not in entry_index:
             return name
-        pinfo = entry_index.get(parent)
+        pinfo = entry_index.get(key)
         if not pinfo or pinfo is info:
             return name
         return resolve_path(pinfo, depth + 1).rstrip("/") + "/" + name
 
-    def carve_runs(runs, size):
-        """Assemble bytes from data runs (sparse runs -> zeros)."""
+    def carve_runs(runs, size, part):
+        """Assemble bytes from data runs (sparse runs -> zeros), using the
+        record's own partition geometry."""
+        po = part.get("part_offset", 0)
+        bpc = part.get("bytes_per_cluster", 4096)
         buf = bytearray()
         for (length, lcn) in runs:
             if lcn is None:                       # sparse
                 buf += bytes(length * bpc)
                 continue
-            abs_off = geom.get("part_offset", 0) + lcn * bpc
+            abs_off = po + lcn * bpc
             buf += reader.read(abs_off, length * bpc)
             if size and len(buf) >= size:
                 break
@@ -890,7 +939,8 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
             path = resolve_path(info) if entry_index else name
             size = info["real_size"]
             t = info.get("si_times", {})
-            entry = info.get("rec_num", "")
+            entry = info.get("_entry")
+            entry = entry if entry is not None else info.get("rec_num", "")
             ads_names = "|".join(s.get("name", "") for s in info.get("ads", []))
             listed += 1
             recovered = ""
@@ -906,7 +956,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                     recovered = "yes"
                     note = "RESIDENT (intact)"
                 elif carve_nonresident and info["data_runs"]:
-                    buf = carve_runs(info["data_runs"], size)
+                    buf = carve_runs(info["data_runs"], size, info["_part"])
                     if buf and buf.count(0) < len(buf):   # not all zeros -> something survived
                         rec_path = safe_write(files_dir, path or name, bytes(buf))
                         targeted_recovered += 1
@@ -927,7 +977,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                     if s.get("resident") is not None:
                         sdata = s["resident"]
                     elif carve_nonresident and s.get("runs"):
-                        cb = carve_runs(s["runs"], s.get("size", 0))
+                        cb = carve_runs(s["runs"], s.get("size", 0), info["_part"])
                         if cb and cb.count(0) < len(cb):
                             sdata = bytes(cb)
                     if sdata:
@@ -993,13 +1043,14 @@ def mine_usn(reader, outdir, regions=None, max_records=20_000_000):
     with open(out_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["timestamp", "reason", "file_ref", "parent_ref", "attrs", "name"])
-        for base, data in iter_windows(reader, extents, window=32 * MiB, overlap=1024):
+        for base, data, valid in iter_windows(reader, extents, window=32 * MiB,
+                                              overlap=1024):
             n = len(data)
             i = 0
             # USN V2 records: major version 2, minor 0 at offset +4. Scan on that.
             while True:
                 j = data.find(b"\x02\x00\x00\x00", i)   # MajorVersion=2, MinorVersion=0
-                if j == -1:
+                if j == -1 or (j - 4) >= valid:
                     break
                 i = j + 1
                 rec_off = j - 4                          # RecordLength precedes version
@@ -1043,6 +1094,11 @@ def mine_usn(reader, outdir, regions=None, max_records=20_000_000):
 #  Phase 4: Archive carving (ZIP / 7z / gzip)                                  #
 # --------------------------------------------------------------------------- #
 
+# Cap how much a single member/stream may decompress to, so a corrupt or
+# hostile archive on the image can't exhaust memory (decompression bomb).
+DECOMP_MEMBER_MAX = 512 * MiB
+
+
 def _overlaps(ranges, s, e):
     for (a, b) in ranges:
         if s < b and a < e:
@@ -1062,11 +1118,12 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
 
     # --- 4a. Whole-archive reconstruction from End-Of-Central-Directory ---
     log("[zip] reconstructing archives from EOCD records ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
+    for base, data, valid in iter_windows(reader, extents, window=64 * MiB,
+                                          overlap=1 * MiB):
         start = 0
         while True:
             idx = data.find(b"PK\x05\x06", start)
-            if idx == -1:
+            if idx == -1 or idx >= valid:
                 break
             start = idx + 4
             eocd_abs = base + idx
@@ -1097,12 +1154,15 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
             arc_dir = os.path.dirname(arc_dir)
             good = 0
             for zi in zf.infolist():
-                try:
-                    content = zf.read(zi)
-                except Exception:
-                    continue
                 if zi.is_dir():
                     continue
+                try:
+                    with zf.open(zi) as zh:           # bounded read = bomb-safe
+                        content = zh.read(DECOMP_MEMBER_MAX + 1)
+                except Exception:
+                    continue
+                if len(content) > DECOMP_MEMBER_MAX:
+                    content = content[:DECOMP_MEMBER_MAX]
                 safe_write(arc_dir, zi.filename, content)
                 good += 1
             whole += 1
@@ -1111,11 +1171,12 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
 
     # --- 4b. Per-member salvage from local file headers (broken central dir) ---
     log("[zip] salvaging individual members from local headers ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
+    for base, data, valid in iter_windows(reader, extents, window=64 * MiB,
+                                          overlap=1 * MiB):
         start = 0
         while True:
             idx = data.find(b"PK\x03\x04", start)
-            if idx == -1:
+            if idx == -1 or idx >= valid:
                 break
             start = idx + 4
             lh_abs = base + idx
@@ -1142,9 +1203,9 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
                 continue
             try:
                 if method == 0:
-                    raw = comp
+                    raw = comp[:DECOMP_MEMBER_MAX]
                 elif method == 8:
-                    raw = zlib.decompressobj(-15).decompress(comp)
+                    raw = zlib.decompressobj(-15).decompress(comp, DECOMP_MEMBER_MAX)
                 else:
                     continue
             except Exception:
@@ -1171,11 +1232,12 @@ def carve_7z(reader, outdir, regions=None, max_size=8 * GiB):
     carved = []
     n = 0
     log("[7z] scanning for CRC-validated 7z headers ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=64):
+    for base, data, valid in iter_windows(reader, extents, window=64 * MiB,
+                                          overlap=64):
         start = 0
         while True:
             idx = data.find(sig, start)
-            if idx == -1:
+            if idx == -1 or idx >= valid:
                 break
             start = idx + 6
             abs_off = base + idx
@@ -1211,11 +1273,12 @@ def carve_gzip(reader, outdir, regions=None, max_member=512 * MiB):
     extents = regions if regions else [(0, reader.size)]
     n = 0
     log("[gz] scanning for gzip streams ...")
-    for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=64):
+    for base, data, valid in iter_windows(reader, extents, window=64 * MiB,
+                                          overlap=64):
         start = 0
         while True:
             idx = data.find(b"\x1f\x8b\x08", start)
-            if idx == -1:
+            if idx == -1 or idx >= valid:
                 break
             start = idx + 3
             abs_off = base + idx
@@ -1225,8 +1288,9 @@ def carve_gzip(reader, outdir, regions=None, max_member=512 * MiB):
             blob = reader.read(abs_off, max_member)
             try:
                 d = zlib.decompressobj(16 + 15)
-                out = d.decompress(blob)
-                out += d.flush()
+                out = d.decompress(blob, DECOMP_MEMBER_MAX)   # bounded = bomb-safe
+                if not d.unconsumed_tail:
+                    out += d.flush()
             except Exception:
                 continue
             if len(out) < 16:
@@ -1517,13 +1581,14 @@ def carve_media(reader, outdir, regions=None):
         w = csv.writer(mf)
         w.writerow(["offset_hex", "kind", "ext", "size_bytes", "size_human",
                     "method", "path"])
-        for base, data in iter_windows(reader, extents, window=64 * MiB, overlap=1 * MiB):
+        for base, data, valid in iter_windows(reader, extents, window=64 * MiB,
+                                              overlap=1 * MiB):
             hits = []
             for sig, handler in MEDIA_SIGS:
                 start = 0
                 while True:
                     idx = data.find(sig, start)
-                    if idx == -1:
+                    if idx == -1 or idx >= valid:
                         break
                     start = idx + 1
                     hits.append((base + idx, handler))
@@ -1669,8 +1734,11 @@ def carve_source(reader, outdir, regions=None, min_len=160,
     with open(man, "w", newline="") as mf:
         w = csv.writer(mf)
         w.writerow(["offset_hex", "length", "language", "score", "path", "preview"])
-        for base, data in iter_windows(reader, extents, window=32 * MiB, overlap=1 * MiB):
+        for base, data, valid in iter_windows(reader, extents, window=32 * MiB,
+                                              overlap=1 * MiB):
             for m in TEXT_RUN.finditer(data):
+                if m.start() >= valid:
+                    break
                 s_abs = base + m.start()
                 e_abs = base + m.end()
                 if s_abs <= processed_upto:
@@ -2117,6 +2185,65 @@ def _mk_record(rec_num, attrs, is_dir=False, rec_size=1024):
     return bytes(rec)
 
 
+def _ntfs_boot(bps, spc, mft_lcn, total_sectors, rec_size=1024):
+    boot = bytearray(512)
+    boot[3:11] = b"NTFS    "
+    struct.pack_into("<H", boot, 0x0B, bps)
+    boot[0x0D] = spc
+    struct.pack_into("<Q", boot, 0x28, total_sectors)
+    struct.pack_into("<Q", boot, 0x30, mft_lcn)
+    boot[0x40] = 256 - 10                       # clusters/record = -10 -> 1024 B
+    boot[510:512] = b"\x55\xaa"
+    return bytes(boot)
+
+
+def _mbr(entries):
+    """entries: list of (ptype, start_lba, num_sectors)."""
+    m = bytearray(512)
+    o = 0x1BE
+    for (pt, slba, ns) in entries:
+        m[o + 4] = pt
+        struct.pack_into("<I", m, o + 8, slba)
+        struct.pack_into("<I", m, o + 12, ns)
+        o += 16
+    m[510:512] = b"\x55\xaa"
+    return bytes(m)
+
+
+def _build_two_partition_image(path):
+    """A whole-disk image with an MBR and TWO NTFS volumes, each with its own
+    MFT — used to prove per-partition geometry (cluster runs relative to the
+    right volume)."""
+    SZ = 12 * MiB
+    bps, spc, bpc = 512, 8, 4096
+    im = bytearray(SZ)
+    PA, PB = 1 * MiB, 6 * MiB
+    # Partition A
+    im[PA:PA + 512] = _ntfs_boot(bps, spc, 4, (PB - PA) // bps)
+    mftA = PA + 4 * bpc
+    im[mftA:mftA + 1024] = _build_mft_record("alpha.rs", 5,
+                                             b"fn main() { let a = 1; }\n")
+    # Partition B (with a non-resident, partition-relative fragmented file)
+    im[PB:PB + 512] = _ntfs_boot(bps, spc, 4, (SZ - PB) // bps)
+    mftB = PB + 4 * bpc
+    im[mftB:mftB + 1024] = _build_mft_record("beta.sol", 5,
+                                             b"pragma solidity ^0.8.0;\ncontract C {}\n")
+    bcontent = b"PARTITION_B_NONRESIDENT_BYTES " * 4
+    L = 200                                      # PB + 200*4096 = 6.78 MiB
+    im[PB + L * bpc:PB + L * bpc + len(bcontent)] = bcontent
+    baseB = _mk_record(6, [
+        _attr_stdinfo(),
+        _attr_filename("bgdata.bin", 5, len(bcontent)),
+        _attr_nonresident(ATTR_DATA, [(1, L)], len(bcontent)),
+    ])
+    im[mftB + 2 * 1024:mftB + 2 * 1024 + len(baseB)] = baseB
+    im[0:512] = _mbr([(0x07, PA // bps, (PB - PA) // bps),
+                      (0x07, PB // bps, (SZ - PB) // bps)])
+    with open(path, "wb") as f:
+        f.write(im)
+    return bcontent
+
+
 def selftest(outdir):
     os.makedirs(outdir, exist_ok=True)
     img_path = os.path.join(outdir, "synthetic.img")
@@ -2326,6 +2453,55 @@ def selftest(outdir):
     except Exception as exc:
         ok = False
         log("[selftest] FAIL: writer raised on name clash: %s" % exc)
+
+    # 6e) Multi-partition whole-disk image (C: + D:): each record must use ITS
+    #     OWN partition geometry for paths and cluster carving.
+    two_img = os.path.join(outdir, "two_part.img")
+    bexpect = _build_two_partition_image(two_img)
+    r2 = Reader(two_img)
+    out2p = os.path.join(outdir, "out_2part")
+    os.makedirs(out2p, exist_ok=True)
+    m2 = mine_mft(r2, out2p, carve_nonresident=True, regions=None)
+    r2.close()
+    twofiles = {}
+    for root, _, fs in os.walk(os.path.join(out2p, "10_mft", "files")):
+        for fn in fs:
+            try:
+                with open(os.path.join(root, fn), "rb") as fh:
+                    twofiles[fn] = fh.read()
+            except Exception:
+                twofiles[fn] = b""
+    if ("alpha.rs" in twofiles and "beta.sol" in twofiles
+            and "bgdata.bin" in twofiles and bexpect[:24] in twofiles["bgdata.bin"]):
+        log("[selftest] PASS: multi-partition geometry — both volumes' files and "
+            "a partition-relative non-resident file recovered correctly")
+    else:
+        ok = False
+        log("[selftest] FAIL: multi-partition recovery (have %s)" % list(twofiles))
+
+    # 6d) Window overlap must process every offset exactly once (no boundary
+    #     duplicates, no misses) — use a tiny window so boundaries land often.
+    with open(img_path, "rb") as f:
+        ground_truth = f.read().count(b"FILE")
+    rwin = Reader(img_path)
+    windowed = 0
+    for wbase, wdata, wvalid in iter_windows(rwin, [(0, rwin.size)],
+                                             window=64 * KiB, overlap=4 * KiB):
+        s = 0
+        while True:
+            k = wdata.find(b"FILE", s)
+            if k == -1 or k >= wvalid:
+                break
+            s = k + 1
+            windowed += 1
+    rwin.close()
+    if windowed == ground_truth and ground_truth > 0:
+        log("[selftest] PASS: window overlap counts each match once "
+            "(%d, no dup/miss across boundaries)" % windowed)
+    else:
+        ok = False
+        log("[selftest] FAIL: overlap dedup (windowed=%d truth=%d)"
+            % (windowed, ground_truth))
 
     # 7) Imaging: ddrescue-style per-sector recovery around a bad sector, then
     #    a verify round-trip (match + mismatch detection).
@@ -2554,7 +2730,10 @@ def main(argv=None):
             results["analyze"] = {k: v for k, v in summary.items() if k != "extents"}
             results["mft"] = mine_mft(reader, args.out, geom=geom,
                                       carve_nonresident=args.carve_nonresident, regions=None)
-            results["usn"] = mine_usn(reader, args.out, regions=ex)
+            # USN records, like MFT records, survive in regions analyze marks as
+            # "dead" (a 1 MiB block holding a few 1 KB records reads mostly-zero),
+            # so scan the whole image — not just the live extents.
+            results["usn"] = mine_usn(reader, args.out, regions=None)
             results["zip"] = carve_zip(reader, args.out, regions=ex)
             results["7z"] = carve_7z(reader, args.out, regions=ex)
             results["gzip"] = carve_gzip(reader, args.out, regions=ex)

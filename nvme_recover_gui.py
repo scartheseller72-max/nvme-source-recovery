@@ -990,8 +990,10 @@ class App(object):
                 argv.append("--carve-nonresident")
             if cmd == "source" and self.opt_unclass.get():
                 argv.append("--include-unclassified")
-            # use regions.json to speed later phases if analyze will have produced it
-            if cmd in ("usn", "archives", "media", "source") and \
+            # Restrict only the bulk-data carvers to live extents (faster). mft
+            # and usn must scan the WHOLE image: their records survive in regions
+            # analyze marks as dead, so region-limiting would miss them.
+            if cmd in ("archives", "media", "source") and \
                     ("analyze" in cmds or os.path.isfile(regions)):
                 argv += ["--regions", regions]
             jobs.append((CMD_LABEL.get(cmd, cmd), argv))
