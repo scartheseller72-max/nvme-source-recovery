@@ -891,15 +891,15 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
 
     def resolve_path(info, depth=0):
         name, parent = pick_name(info["names"])
-        if depth > 64:
+        if not name:                       # nameless (e.g. extension) record
+            return ""
+        if depth > 64 or parent in (0, 5):
             return name
-        key = (id(info["_part"]), parent)
-        if parent in (0, 5) or key not in entry_index:
-            return name
-        pinfo = entry_index.get(key)
+        pinfo = entry_index.get((id(info["_part"]), parent))
         if not pinfo or pinfo is info:
             return name
-        return resolve_path(pinfo, depth + 1).rstrip("/") + "/" + name
+        parent_path = resolve_path(pinfo, depth + 1)
+        return (parent_path.rstrip("/") + "/" + name) if parent_path else name
 
     def carve_runs(runs, size, part):
         """Assemble bytes from data runs (sparse runs -> zeros), using the
@@ -936,7 +936,11 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
             name, parent = pick_name(info["names"])
             if not name:
                 continue
-            path = resolve_path(info) if entry_index else name
+            try:
+                path = resolve_path(info) if entry_index else name
+            except Exception:
+                path = name                    # never let path resolution abort
+            path = path or name
             size = info["real_size"]
             t = info.get("si_times", {})
             entry = info.get("_entry")
@@ -2297,6 +2301,16 @@ def selftest(outdir):
     ])
     img[mft_off + 4 * 1024:mft_off + 4 * 1024 + len(ads_rec)] = ads_rec
 
+    # entry 5: a file whose parent (entry 3) is a NAMELESS extension record —
+    # exercises the path resolver against a parent that has no name (regression
+    # for the AttributeError crash on a real 4.8M-record disk).
+    orphan = _mk_record(5, [
+        _attr_stdinfo(),
+        _attr_filename("child_of_ext.rs", 3, 5),
+        _attr_resident(ATTR_DATA, b"fn x(){}"),
+    ])
+    img[mft_off + 5 * 1024:mft_off + 5 * 1024 + len(orphan)] = orphan
+
     # 3) A real ZIP somewhere in the "data" area
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2436,6 +2450,12 @@ def selftest(outdir):
         ok = False
         log("[selftest] FAIL: ADS recovery (ads_recovered=%s)"
             % madv.get("ads_recovered"))
+    # parent points at a nameless extension record: must not crash, file kept
+    if "child_of_ext.rs" in adv_files:
+        log("[selftest] PASS: path resolver survives a nameless parent record")
+    else:
+        ok = False
+        log("[selftest] FAIL: nameless-parent path resolution")
 
     # 6c) Writer must survive file-vs-directory name clashes (garbled names)
     #     without crashing — the bug that aborted a real mft run mid-phase.
