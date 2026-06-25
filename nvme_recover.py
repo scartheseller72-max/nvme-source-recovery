@@ -148,16 +148,33 @@ def _makedirs_resilient(target, root):
 def safe_write(outroot, relpath, data):
     """Write data under outroot/relpath, defeating path traversal. Returns final
     path. Resilient to file/dir name clashes among recovered (often garbled)
-    names — it never raises just because two items sanitize to the same name."""
-    relpath = sanitize_relpath(relpath)
-    full = os.path.normpath(os.path.join(outroot, relpath))
-    if not (full == outroot or full.startswith(outroot + os.sep)):
-        full = os.path.join(outroot, os.path.basename(relpath) or "unnamed")
-    parent = _makedirs_resilient(os.path.dirname(full) or outroot, outroot)
-    full = unique_path(os.path.join(parent, os.path.basename(full) or "unnamed"))
-    with open(full, "wb") as f:
-        f.write(data)
-    return full
+    names, over-long paths, and other filesystem quirks — it NEVER raises just
+    because of a bad name, so one weird record can't abort an hours-long run.
+    Falls back to a short, guaranteed-safe name when the natural path fails."""
+    try:
+        relpath = sanitize_relpath(relpath)
+        full = os.path.normpath(os.path.join(outroot, relpath))
+        if not (full == outroot or full.startswith(outroot + os.sep)):
+            full = os.path.join(outroot, os.path.basename(relpath) or "unnamed")
+        parent = _makedirs_resilient(os.path.dirname(full) or outroot, outroot)
+        full = unique_path(os.path.join(parent, os.path.basename(full) or "unnamed"))
+        with open(full, "wb") as f:
+            f.write(data)
+        return full
+    except Exception:
+        # Last-resort: a short, collision-free name directly under outroot.
+        try:
+            import hashlib
+            os.makedirs(outroot, exist_ok=True)
+            tag = hashlib.sha1((relpath or "x").encode("utf-8", "replace")
+                               + os.urandom(4)).hexdigest()[:16]
+            fallback = unique_path(os.path.join(outroot, "recovered_" + tag))
+            with open(fallback, "wb") as f:
+                f.write(data)
+            return fallback
+        except Exception as exc:
+            log("[!] safe_write failed for %r: %s" % (relpath, exc))
+            return None
 
 
 def filetime_to_iso(ft):
@@ -736,7 +753,7 @@ def pick_name(names):
 
 
 def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
-             max_records=5_000_000, regions=None):
+             max_records=20_000_000, regions=None):
     """Scan for MFT FILE records, rebuild the deleted file tree, recover resident
     files intact, and (optionally) targeted-carve non-resident files."""
     m_dir = os.path.join(outdir, "10_mft")
@@ -842,7 +859,7 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
                 continue
             by_offset.append(info)
             found += 1
-            if found % 2000 == 0:
+            if found % 50000 == 0:
                 log("[mft]   parsed %d records (at %s)" % (found, human(abs_off)))
             if found >= max_records:
                 break
@@ -850,6 +867,10 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
         if found >= max_records:
             break
 
+    if found >= max_records:
+        log("[mft] !! hit the %d-record cap — scan stopped early; some records "
+            "were NOT processed. Re-run with a higher --max-records if needed."
+            % max_records)
     log("[mft] parsed %d MFT records with names (%d total indexed)" %
         (found, len(entry_index)))
 
@@ -903,19 +924,27 @@ def mine_mft(reader, outdir, geom=None, carve_nonresident=False,
 
     def carve_runs(runs, size, part):
         """Assemble bytes from data runs (sparse runs -> zeros), using the
-        record's own partition geometry."""
+        record's own partition geometry. Capped so a corrupt run length can't
+        allocate unbounded memory."""
         po = part.get("part_offset", 0)
         bpc = part.get("bytes_per_cluster", 4096)
+        cap = size if size else DECOMP_MEMBER_MAX
+        cap = min(cap, DECOMP_MEMBER_MAX) if not size else size
         buf = bytearray()
         for (length, lcn) in runs:
+            if length <= 0 or len(buf) >= cap:
+                break
+            want = min(length * bpc, cap - len(buf) + bpc)
             if lcn is None:                       # sparse
-                buf += bytes(length * bpc)
+                buf += bytes(min(length * bpc, want))
                 continue
             abs_off = po + lcn * bpc
-            buf += reader.read(abs_off, length * bpc)
+            if abs_off < 0 or abs_off >= reader.size:
+                break
+            buf += reader.read(abs_off, want)
             if size and len(buf) >= size:
                 break
-        return buf[:size] if size else buf
+        return bytes(buf[:size]) if size else bytes(buf)
 
     # Recover files + write manifest
     import csv
@@ -1154,8 +1183,8 @@ def carve_zip(reader, outdir, regions=None, max_size=2 * GiB):
             except Exception:
                 continue
             carved.append((arc_start, arc_start + total))
-            arc_dir = safe_write(z_dir, "archive_%012x" % arc_start + "/.keep", b"")
-            arc_dir = os.path.dirname(arc_dir)
+            arc_dir = _makedirs_resilient(
+                os.path.join(z_dir, "archive_%012x" % arc_start), z_dir)
             good = 0
             for zi in zf.infolist():
                 if zi.is_dir():
@@ -1598,22 +1627,25 @@ def carve_media(reader, outdir, regions=None):
                     hits.append((base + idx, handler))
             hits.sort(key=lambda h: h[0])
             for abs_off, handler in hits:
-                res = handler(reader, abs_off)
-                if not res:
-                    continue
-                fstart, total, kind, ext, method = res
-                if _overlaps(carved, fstart, fstart + total):
-                    continue
-                blob = reader.read(fstart, total)
-                if not blob or blob.count(0) >= len(blob) - 16:
-                    continue                               # all zeros => TRIMed
-                carved.append((fstart, fstart + total))
-                dest = photo_dir if kind == "photos" else video_dir
-                path = safe_write(dest, "media_%012x.%s" % (fstart, ext), blob)
-                counts[kind] += 1
-                by_ext[ext] = by_ext.get(ext, 0) + 1
-                w.writerow(["0x%x" % fstart, kind, ext, total, human(total),
-                            method, path])
+                try:
+                    res = handler(reader, abs_off)
+                    if not res:
+                        continue
+                    fstart, total, kind, ext, method = res
+                    if _overlaps(carved, fstart, fstart + total):
+                        continue
+                    blob = reader.read(fstart, total)
+                    if not blob or blob.count(0) >= len(blob) - 16:
+                        continue                           # all zeros => TRIMed
+                    carved.append((fstart, fstart + total))
+                    dest = photo_dir if kind == "photos" else video_dir
+                    path = safe_write(dest, "media_%012x.%s" % (fstart, ext), blob)
+                    counts[kind] += 1
+                    by_ext[ext] = by_ext.get(ext, 0) + 1
+                    w.writerow(["0x%x" % fstart, kind, ext, total, human(total),
+                                method, path])
+                except Exception:
+                    continue                               # one bad file ≠ phase abort
                 if (counts["photos"] + counts["videos"]) % 50 == 0:
                     log("[media]   %d photos, %d videos so far" %
                         (counts["photos"], counts["videos"]))
@@ -2499,6 +2531,26 @@ def selftest(outdir):
         ok = False
         log("[selftest] FAIL: multi-partition recovery (have %s)" % list(twofiles))
 
+    # 6f) safe_write must never raise — even on an impossible (over-long) name —
+    #     so one weird record can't abort an hours-long run.
+    hard = os.path.join(outdir, "hard")
+    try:
+        p_long = safe_write(hard, "x" * 9000 + "/" + "y" * 9000 + ".bin", b"ok")
+        p_ctrl = safe_write(hard, "\x00\x01\x02/../../etc/passwd", b"safe")
+        p_empty = safe_write(hard, "", b"noname")
+        if (p_long and os.path.isfile(p_long) and p_ctrl and os.path.isfile(p_ctrl)
+                and p_empty and os.path.isfile(p_empty)
+                # traversal contained: everything stays under `hard`
+                and os.path.abspath(p_ctrl).startswith(os.path.abspath(hard))):
+            log("[selftest] PASS: safe_write survives impossible names & blocks traversal")
+        else:
+            ok = False
+            log("[selftest] FAIL: safe_write hardening (%s, %s, %s)"
+                % (p_long, p_ctrl, p_empty))
+    except Exception as exc:
+        ok = False
+        log("[selftest] FAIL: safe_write raised: %s" % exc)
+
     # 6d) Window overlap must process every offset exactly once (no boundary
     #     duplicates, no misses) — use a tiny window so boundaries land often.
     with open(img_path, "rb") as f:
@@ -2633,6 +2685,8 @@ def main(argv=None):
                     help="also pull file data from cluster runs (may be zeros if TRIMed)")
     sp.add_argument("--cluster-size", type=int, default=None)
     sp.add_argument("--mft-offset", type=int, default=None)
+    sp.add_argument("--max-records", type=int, default=20_000_000,
+                    help="cap on named MFT records to process")
 
     sp = sub.add_parser("usn"); add_common(sp)
     sp = sub.add_parser("archives"); add_common(sp)
@@ -2641,6 +2695,8 @@ def main(argv=None):
     sp.add_argument("--include-unclassified", action="store_true")
     sp = sub.add_parser("all"); add_common(sp)
     sp.add_argument("--carve-nonresident", action="store_true")
+    sp.add_argument("--max-records", type=int, default=20_000_000,
+                    help="cap on named MFT records to process")
 
     sp = sub.add_parser("selftest")
     sp.add_argument("--out", default="/tmp/nvme_selftest")
@@ -2727,7 +2783,8 @@ def main(argv=None):
         elif args.cmd == "mft":
             ex = load_extents(reader, args.regions) if args.regions else None
             mine_mft(reader, args.out, geom=geom,
-                     carve_nonresident=args.carve_nonresident, regions=ex)
+                     carve_nonresident=args.carve_nonresident, regions=ex,
+                     max_records=args.max_records)
         elif args.cmd == "usn":
             ex = load_extents(reader, args.regions) if args.regions else None
             mine_usn(reader, args.out, regions=ex)
@@ -2748,17 +2805,29 @@ def main(argv=None):
             summary = analyze(reader, args.out)
             ex = [(int(s), int(e)) for s, e in summary["extents"]]
             results["analyze"] = {k: v for k, v in summary.items() if k != "extents"}
-            results["mft"] = mine_mft(reader, args.out, geom=geom,
-                                      carve_nonresident=args.carve_nonresident, regions=None)
-            # USN records, like MFT records, survive in regions analyze marks as
-            # "dead" (a 1 MiB block holding a few 1 KB records reads mostly-zero),
-            # so scan the whole image — not just the live extents.
-            results["usn"] = mine_usn(reader, args.out, regions=None)
-            results["zip"] = carve_zip(reader, args.out, regions=ex)
-            results["7z"] = carve_7z(reader, args.out, regions=ex)
-            results["gzip"] = carve_gzip(reader, args.out, regions=ex)
-            results["media"] = carve_media(reader, args.out, regions=ex)
-            results["source"] = carve_source(reader, args.out, regions=ex)
+
+            # Each phase is isolated: if one fails on this particular image, the
+            # others (and the summary) still run — you never lose the whole job.
+            def phase(name, fn):
+                try:
+                    results[name] = fn()
+                except Exception as exc:
+                    import traceback
+                    log("[!] phase '%s' failed: %s" % (name, exc))
+                    log(traceback.format_exc())
+                    results[name] = {"error": str(exc)}
+
+            # mft and usn scan the WHOLE image: their records survive in regions
+            # analyze marks as "dead", so region-limiting would miss them.
+            phase("mft", lambda: mine_mft(reader, args.out, geom=geom,
+                  carve_nonresident=args.carve_nonresident, regions=None,
+                  max_records=args.max_records))
+            phase("usn", lambda: mine_usn(reader, args.out, regions=None))
+            phase("zip", lambda: carve_zip(reader, args.out, regions=ex))
+            phase("7z", lambda: carve_7z(reader, args.out, regions=ex))
+            phase("gzip", lambda: carve_gzip(reader, args.out, regions=ex))
+            phase("media", lambda: carve_media(reader, args.out, regions=ex))
+            phase("source", lambda: carve_source(reader, args.out, regions=ex))
             write_summary(args.out, results)
     finally:
         reader.close()

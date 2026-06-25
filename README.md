@@ -350,7 +350,7 @@ python3 nvme_recover.py <command> --image <IMG|/dev/nvmeXn1> --out <DIR> [option
 
   analyze   --block-size N             zero/entropy region map
   mft       [--carve-nonresident]      $MFT mining (+ optional cluster carve)
-            [--cluster-size N] [--mft-offset N]
+            [--cluster-size N] [--mft-offset N] [--max-records N]
   usn                                  $UsnJrnl delete log
   archives                             ZIP / 7z / gzip carving
   media                                photo + video carving (true boundaries)

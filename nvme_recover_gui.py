@@ -1492,28 +1492,46 @@ class App(object):
         # tree
         self._populate_tree()
 
+    TREE_CAP = 20000          # don't try to render millions of recovered files
+
     def _populate_tree(self):
         out = self.last_out or self.out_var.get().strip()
         self.tree.delete(*self.tree.get_children())
         self._tree_paths = {}
         self._all_files = []
+        self._tree_truncated = False
         if out and os.path.isdir(out):
-            self._add_tree_dir("", out, depth=0)
+            try:
+                self._add_tree_dir("", out, depth=0)
+            except Exception:
+                pass
         n = len(self._all_files)
-        self.tree_count.configure(text="%d file%s" % (n, "" if n == 1 else "s"))
+        suffix = "+ (showing first %d — use Open output)" % self.TREE_CAP \
+            if self._tree_truncated else ""
+        self.tree_count.configure(
+            text="%d file%s %s" % (n, "" if n == 1 else "s", suffix))
 
     def _add_tree_dir(self, parent, path, depth):
-        if depth > 6:
+        if depth > 6 or len(self._all_files) >= self.TREE_CAP:
+            if len(self._all_files) >= self.TREE_CAP:
+                self._tree_truncated = True
             return
         try:
             entries = sorted(os.listdir(path))
         except Exception:
             return
         for name in entries:
+            if len(self._all_files) >= self.TREE_CAP:
+                self._tree_truncated = True
+                return
             full = os.path.join(path, name)
-            isdir = os.path.isdir(full)
-            label = name + ("/" if isdir else "  (%s)" % human(os.path.getsize(full))
-                            if os.path.isfile(full) else "")
+            try:
+                isdir = os.path.isdir(full)
+                sz = "  (%s)" % human(os.path.getsize(full)) \
+                    if (not isdir and os.path.isfile(full)) else ""
+            except Exception:
+                continue
+            label = name + ("/" if isdir else sz)
             node = self.tree.insert(parent, "end", text=label, open=(depth == 0))
             self._tree_paths[node] = full
             if isdir:
